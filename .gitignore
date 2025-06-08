@@ -1,4 +1,20 @@
-<<<<<<< HEAD
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.env
+
+#temporary and working files
+*.log
+*.csv
+*.db
+openalex-snapshot
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -193,22 +209,3 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
-=======
-# Python-generated files
-__pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-
-# Virtual environments
-.venv
-.env
-
-#temporary and working files
-*.log
-*.csv
-*.db
-openalex-snapshot
->>>>>>> master
