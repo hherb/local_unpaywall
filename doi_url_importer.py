@@ -45,7 +45,7 @@ except ImportError:
 
 # Set up logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.ERROR,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('doi_url_import.log'),
@@ -85,75 +85,103 @@ class DOIURLImporter:
             raise
 
     def create_schema(self):
-        """Create the DOI-URL mapping tables"""
+        """Create the DOI-URL mapping tables with error handling"""
         logger.info("Creating DOI-URL schema...")
         
-        schema_sql = """
-        -- Main table for DOI to URL mappings
-        CREATE TABLE IF NOT EXISTS doi_urls (
-            id BIGSERIAL PRIMARY KEY,
-            doi TEXT NOT NULL,
-            url TEXT NOT NULL,
-            pdf_url TEXT,
-            openalex_id TEXT,
-            title TEXT,
-            publication_year INTEGER,
-            location_type TEXT NOT NULL,
-            version TEXT,
-            license TEXT,
-            host_type TEXT,
-            oa_status TEXT,
-            is_oa BOOLEAN DEFAULT FALSE,
-            url_quality_score INTEGER DEFAULT 50,
-            last_verified TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        -- Indexes for efficient querying
-        CREATE INDEX IF NOT EXISTS idx_doi_urls_doi ON doi_urls(doi);
-        CREATE INDEX IF NOT EXISTS idx_doi_urls_url ON doi_urls(url);
-        CREATE INDEX IF NOT EXISTS idx_doi_urls_pdf_url ON doi_urls(pdf_url) WHERE pdf_url IS NOT NULL;
-        CREATE INDEX IF NOT EXISTS idx_doi_urls_doi_location_type ON doi_urls(doi, location_type);
-        CREATE INDEX IF NOT EXISTS idx_doi_urls_oa_status ON doi_urls(oa_status) WHERE is_oa = TRUE;
-        CREATE INDEX IF NOT EXISTS idx_doi_urls_host_type ON doi_urls(host_type);
-        CREATE INDEX IF NOT EXISTS idx_doi_urls_publication_year ON doi_urls(publication_year);
-
-        -- Unique constraint to prevent duplicate DOI-URL pairs
-        DO $$ 
-        BEGIN
-            BEGIN
-                ALTER TABLE doi_urls ADD CONSTRAINT unique_doi_url UNIQUE(doi, url);
-            EXCEPTION
-                WHEN duplicate_table THEN
-                    -- Constraint already exists
-                    NULL;
-            END;
-        END $$;
-
-        -- Optional metadata table
-        CREATE TABLE IF NOT EXISTS doi_metadata (
-            doi TEXT PRIMARY KEY,
-            openalex_id TEXT UNIQUE,
-            title TEXT,
-            publication_year INTEGER,
-            work_type TEXT,
-            is_retracted BOOLEAN DEFAULT FALSE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_doi_metadata_year ON doi_metadata(publication_year);
-        CREATE INDEX IF NOT EXISTS idx_doi_metadata_type ON doi_metadata(work_type);
-        """
+        # First check if tables already exist
+        with self.connect_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_name = 'doi_urls'
+                    )
+                """)
+                table_exists = cur.fetchone()[0]
+                
+                if table_exists:
+                    logger.info("doi_urls table already exists")
+                    # Check if it has the unique constraint
+                    cur.execute("""
+                        SELECT COUNT(*) FROM pg_constraint 
+                        WHERE conname = 'unique_doi_url' AND conrelid = 'doi_urls'::regclass
+                    """)
+                    has_constraint = cur.fetchone()[0] > 0
+                    
+                    if not has_constraint:
+                        logger.warning("unique_doi_url constraint missing - will add it")
+                else:
+                    logger.info("doi_urls table does not exist - will create it")
         
+        # Create tables with explicit transaction handling
         with self.connect_db() as conn:
             with conn.cursor() as cur:
                 try:
-                    cur.execute(schema_sql)
+                    # Create main table if it doesn't exist
+                    if not table_exists:
+                        cur.execute("""
+                        CREATE TABLE IF NOT EXISTS doi_urls (
+                            id BIGSERIAL PRIMARY KEY,
+                            doi TEXT NOT NULL,
+                            url TEXT NOT NULL,
+                            pdf_url TEXT,
+                            openalex_id TEXT,
+                            title TEXT,
+                            publication_year INTEGER,
+                            location_type TEXT NOT NULL,
+                            version TEXT,
+                            license TEXT,
+                            host_type TEXT,
+                            oa_status TEXT,
+                            is_oa BOOLEAN DEFAULT FALSE,
+                            url_quality_score INTEGER DEFAULT 50,
+                            last_verified TIMESTAMP,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                        """)
+                        logger.info("Created doi_urls table")
+                    
+                    # Create indexes
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_doi_urls_doi ON doi_urls(doi)")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_doi_urls_url ON doi_urls(url)")
+                    
+                    # Add unique constraint if it doesn't exist
+                    if not table_exists or not has_constraint:
+                        try:
+                            cur.execute("ALTER TABLE doi_urls ADD CONSTRAINT unique_doi_url UNIQUE(doi, url)")
+                            logger.info("Added unique_doi_url constraint")
+                        except psycopg2.Error as e:
+                            if "already exists" in str(e):
+                                logger.info("unique_doi_url constraint already exists")
+                            else:
+                                raise
+                    
+                    # Create metadata table
+                    cur.execute("""
+                    CREATE TABLE IF NOT EXISTS doi_metadata (
+                        doi TEXT PRIMARY KEY,
+                        openalex_id TEXT UNIQUE,
+                        title TEXT,
+                        publication_year INTEGER,
+                        work_type TEXT,
+                        is_retracted BOOLEAN DEFAULT FALSE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """)
+                    
+                    # Commit all changes
                     conn.commit()
                     logger.info("Schema created successfully")
+                    
+                    # Verify tables exist
+                    cur.execute("SELECT COUNT(*) FROM doi_urls")
+                    count = cur.fetchone()[0]
+                    logger.info(f"doi_urls table exists with {count} rows")
+                    
                 except psycopg2.Error as e:
+                    conn.rollback()
                     logger.error(f"Schema creation failed: {e}")
                     raise
 
@@ -326,92 +354,81 @@ class DOIURLImporter:
 
         logger.info(f"CSV file has {line_count:,} lines")
 
-        with open(self.csv_file, 'r', encoding='utf-8') as csvfile:
-            # Detect delimiter with fallback options
-            sample = csvfile.read(8192)  # Larger sample for better detection
-            csvfile.seek(0)
+        # Use comma delimiter directly as specified
+        delimiter = ','
+        logger.info("Using comma as CSV delimiter")
 
-            delimiter = ','  # Default fallback
+        with open(self.csv_file, 'r', encoding='utf-8', errors='replace') as csvfile:
             try:
-                sniffer = csv.Sniffer()
-                delimiter = sniffer.sniff(sample, delimiters=',;\t|').delimiter
-                logger.info(f"Detected CSV delimiter: '{delimiter}'")
-            except csv.Error:
-                # Fallback: try common delimiters in order of likelihood
-                common_delimiters = [',', '\t', ';', '|']
-                delimiter_counts = {}
+                reader = csv.DictReader(csvfile, delimiter=delimiter)
 
-                for delim in common_delimiters:
-                    delimiter_counts[delim] = sample.count(delim)
+                # Validate CSV structure by checking first row
+                try:
+                    first_row = next(reader)
+                    csvfile.seek(0)
+                    reader = csv.DictReader(csvfile, delimiter=delimiter)  # Reset reader
 
-                # Choose delimiter with highest count (if any)
-                if any(count > 0 for count in delimiter_counts.values()):
-                    delimiter = max(delimiter_counts, key=lambda x: delimiter_counts[x])
-                    logger.info(f"Auto-detected CSV delimiter: '{delimiter}' (found {delimiter_counts[delimiter]} occurrences)")
-                else:
-                    logger.warning(f"Could not detect delimiter, using default comma. Sample: {sample[:200]}")
+                    # Check if we have expected columns
+                    expected_columns = ['doi', 'url']  # Minimum required columns
+                    missing_columns = [col for col in expected_columns if col not in first_row]
+                    if missing_columns:
+                        logger.warning(f"Missing expected columns: {missing_columns}")
+                        logger.info(f"Available columns: {list(first_row.keys())}")
+                        raise ValueError(f"CSV is missing required columns: {missing_columns}")
 
-            reader = csv.DictReader(csvfile, delimiter=delimiter)
+                    # Log the first row for debugging
+                    logger.info(f"First row sample: {first_row}")
 
-            # Validate CSV structure by checking first few rows
-            first_row = None
-            try:
-                first_row = next(reader)
-                csvfile.seek(0)
-                reader = csv.DictReader(csvfile, delimiter=delimiter)  # Reset reader
+                except StopIteration:
+                    raise ValueError("CSV file appears to be empty or has no data rows")
 
-                # Check if we have expected columns
-                expected_columns = ['doi', 'url']  # Minimum required columns
-                missing_columns = [col for col in expected_columns if col not in first_row]
-                if missing_columns:
-                    logger.warning(f"Missing expected columns: {missing_columns}")
-                    logger.info(f"Available columns: {list(first_row.keys())}")
+                # Initialize progress bar
+                progress_bar = tqdm(
+                    total=line_count - 1,  # Subtract 1 for header
+                    desc="Processing CSV",
+                    unit="rows",
+                    unit_scale=True
+                )
 
-            except StopIteration:
-                raise ValueError("CSV file appears to be empty or has no data rows")
-            except Exception as e:
-                logger.error(f"Error reading CSV structure: {e}")
-                logger.info(f"First few characters of file: {sample[:100]}")
-                raise
+                current_batch = []
+                batch_count = 0
+                valid_rows = 0
+                invalid_rows = 0
 
-            # Initialize progress bar
-            progress_bar = tqdm(
-                total=line_count - 1,  # Subtract 1 for header
-                desc="Processing CSV",
-                unit="rows",
-                unit_scale=True
-            )
+                try:
+                    for row in reader:
+                        cleaned_row = self.validate_and_clean_row(row)
 
-            current_batch = []
-            batch_count = 0
+                        if cleaned_row:
+                            current_batch.append(cleaned_row)
+                            valid_rows += 1
+                        else:
+                            invalid_rows += 1
+                            self.stats['rows_skipped'] += 1
 
-            try:
-                for row in reader:
-                    cleaned_row = self.validate_and_clean_row(row)
+                        self.stats['total_rows_processed'] += 1
+                        progress_bar.update(1)
 
-                    if cleaned_row:
-                        current_batch.append(cleaned_row)
-                    else:
-                        self.stats['rows_skipped'] += 1
+                        # When batch is full, yield it and start a new one
+                        if len(current_batch) >= self.batch_size:
+                            batch_count += 1
+                            logger.info(f"Yielding batch {batch_count} with {len(current_batch)} rows")
+                            yield current_batch
+                            current_batch = []
 
-                    self.stats['total_rows_processed'] += 1
-                    progress_bar.update(1)
-
-                    # When batch is full, yield it and start a new one
-                    if len(current_batch) >= self.batch_size:
+                    # Yield final batch if not empty
+                    if current_batch:
                         batch_count += 1
+                        logger.info(f"Yielding final batch {batch_count} with {len(current_batch)} rows")
                         yield current_batch
-                        current_batch = []
 
-                # Yield final batch if not empty
-                if current_batch:
-                    batch_count += 1
-                    yield current_batch
+                finally:
+                    progress_bar.close()
+                    logger.info(f"CSV processing complete: {valid_rows} valid rows, {invalid_rows} invalid rows skipped")
 
-            finally:
-                progress_bar.close()
-
-        logger.debug(f"CSV processing complete. {batch_count} batches yielded.")
+            except Exception as e:
+                logger.error(f"Error processing CSV: {e}")
+                raise
 
     def _deduplicate_batch(self, batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
@@ -502,45 +519,25 @@ class DOIURLImporter:
         # Prepare data for bulk insert
         insert_data = []
         for row in deduplicated_batch:
+            # Ensure all required fields are present
             insert_data.append((
                 row['doi'],
                 row['url'],
-                row['pdf_url'],
-                row['openalex_id'],
-                row['title'],
-                row['publication_year'],
-                row['location_type'],
-                row['version'],
-                row['license'],
-                row['host_type'],
-                row['oa_status'],
-                row['is_oa'],
-                row['url_quality_score']
+                row.get('pdf_url'),
+                row.get('openalex_id'),
+                row.get('title'),
+                row.get('publication_year'),
+                row.get('location_type', 'unknown'),  # Provide default for required field
+                row.get('version'),
+                row.get('license'),
+                row.get('host_type'),
+                row.get('oa_status'),
+                row.get('is_oa', False),
+                row.get('url_quality_score', 50)
             ))
         
-        insert_sql = """
-        INSERT INTO doi_urls (
-            doi, url, pdf_url, openalex_id, title, publication_year, location_type,
-            version, license, host_type, oa_status, is_oa, url_quality_score
-        ) VALUES %s
-        ON CONFLICT (doi, url) DO UPDATE SET
-            pdf_url = CASE
-                WHEN EXCLUDED.pdf_url IS NOT NULL AND EXCLUDED.pdf_url != ''
-                THEN EXCLUDED.pdf_url
-                ELSE doi_urls.pdf_url
-            END,
-            openalex_id = EXCLUDED.openalex_id,
-            title = EXCLUDED.title,
-            publication_year = EXCLUDED.publication_year,
-            location_type = EXCLUDED.location_type,
-            version = EXCLUDED.version,
-            license = EXCLUDED.license,
-            host_type = EXCLUDED.host_type,
-            oa_status = EXCLUDED.oa_status,
-            is_oa = EXCLUDED.is_oa,
-            url_quality_score = EXCLUDED.url_quality_score,
-            updated_at = CURRENT_TIMESTAMP
-        """
+        rows_inserted = 0
+        rows_updated = 0
         
         try:
             with connection.cursor() as cur:
@@ -548,22 +545,70 @@ class DOIURLImporter:
                 cur.execute("SELECT COUNT(*) FROM doi_urls")
                 count_before = cur.fetchone()[0]
                 
-                # Execute bulk insert
-                execute_values(
-                    cur, insert_sql, insert_data,
-                    template=None, page_size=self.batch_size
-                )
+                # Use a very small chunk size for reliability
+                chunk_size = 50
                 
+                for i in range(0, len(insert_data), chunk_size):
+                    chunk = insert_data[i:i+chunk_size]
+                    logger.info(f"Processing chunk {i//chunk_size + 1}/{(len(insert_data) + chunk_size - 1) // chunk_size} ({len(chunk)} rows)")
+                    
+                    # Try row-by-row insertion for maximum reliability
+                    for j, row_data in enumerate(chunk):
+                        try:
+                            cur.execute("""
+                                INSERT INTO doi_urls (
+                                    doi, url, pdf_url, openalex_id, title, publication_year, location_type,
+                                    version, license, host_type, oa_status, is_oa, url_quality_score
+                                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                ON CONFLICT (doi, url) DO UPDATE SET
+                                    pdf_url = CASE
+                                        WHEN EXCLUDED.pdf_url IS NOT NULL AND EXCLUDED.pdf_url != ''
+                                        THEN EXCLUDED.pdf_url
+                                        ELSE doi_urls.pdf_url
+                                    END,
+                                    openalex_id = EXCLUDED.openalex_id,
+                                    title = EXCLUDED.title,
+                                    publication_year = EXCLUDED.publication_year,
+                                    location_type = EXCLUDED.location_type,
+                                    version = EXCLUDED.version,
+                                    license = EXCLUDED.license,
+                                    host_type = EXCLUDED.host_type,
+                                    oa_status = EXCLUDED.oa_status,
+                                    is_oa = EXCLUDED.is_oa,
+                                    url_quality_score = EXCLUDED.url_quality_score,
+                                    updated_at = CURRENT_TIMESTAMP
+                                RETURNING (xmax = 0) AS inserted
+                            """, row_data)
+                            
+                            # Check if row was inserted or updated
+                            result = cur.fetchone()
+                            if result and result[0]:  # xmax = 0 means inserted
+                                rows_inserted += 1
+                            else:
+                                rows_updated += 1
+                            
+                            # Commit every 10 rows
+                            if (j + 1) % 10 == 0:
+                                connection.commit()
+                                
+                        except Exception as e:
+                            connection.rollback()
+                            logger.error(f"Error inserting row {i+j}: {e}")
+                            # Continue with next row
+                
+                # Commit any remaining rows in this chunk
+                connection.commit()
+                logger.info(f"Committed chunk {i//chunk_size + 1}: {rows_inserted} inserted, {rows_updated} updated so far")
+            
                 # Get count after insert  
                 cur.execute("SELECT COUNT(*) FROM doi_urls")
                 count_after = cur.fetchone()[0]
                 
-                connection.commit()
+                # Verify counts
+                actual_diff = count_after - count_before
+                logger.info(f"Database count change: +{actual_diff} rows (expected +{rows_inserted})")
                 
-                rows_affected = count_after - count_before
-                rows_updated = len(deduplicated_batch) - rows_affected
-                
-                return rows_affected, rows_updated
+                return rows_inserted, rows_updated
                 
         except psycopg2.Error as e:
             connection.rollback()
@@ -628,47 +673,102 @@ class DOIURLImporter:
             if self.create_tables:
                 self.create_schema()
 
-            # Process CSV in batches using memory-efficient generator
-            batch_generator = self.read_csv_in_batches()
-
-            # Convert generator to list to get total count for progress bar
-            logger.info("Preparing batches for processing...")
-            batches = list(batch_generator)
-            total_batches = len(batches)
-
-            if total_batches == 0:
-                logger.warning("No valid batches to process")
+            # Test database connection and insertion
+            test_success = self.test_database_connection()
+            if not test_success:
+                logger.error("Database test failed - cannot proceed with import")
                 return
 
-            logger.info(f"Processing {total_batches} batches...")
-
-            # Import batches with progress bar
+            # Process CSV in batches using memory-efficient generator
+            logger.info("Reading CSV file and processing batches...")
+            batch_generator = self.read_csv_in_batches()
+            
+            # Process batches directly without converting to list
             with self.connect_db() as conn:
-                batch_progress = tqdm(
-                    batches,
-                    desc="Processing batches",
-                    unit="batch",
-                    leave=True
-                )
-
-                for batch in batch_progress:
-                    rows_inserted, rows_updated = self.insert_batch(batch, conn)
-                    self.stats['rows_inserted'] += rows_inserted
-                    self.stats['rows_updated'] += rows_updated
-
-                    # Update progress bar description with current stats
-                    batch_progress.set_postfix({
-                        'inserted': f"{rows_inserted:,}",
-                        'updated': f"{rows_updated:,}",
-                        'total_ins': f"{self.stats['rows_inserted']:,}",
-                        'total_upd': f"{self.stats['rows_updated']:,}"
-                    })
-
-                batch_progress.close()
-
-                # Update metadata table
-                logger.info("Updating DOI metadata...")
-                self.update_doi_metadata(conn)
+                # Get initial count
+                with conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) FROM doi_urls")
+                    initial_count = cur.fetchone()[0]
+                    logger.info(f"Initial database count: {initial_count} rows")
+                
+                batch_count = 0
+                total_rows_processed = 0
+                
+                # Process each batch as it comes from the generator
+                for batch in batch_generator:
+                    batch_count += 1
+                    total_rows_processed += len(batch)
+                    
+                    logger.info(f"Processing batch {batch_count} with {len(batch)} rows (total processed: {total_rows_processed})")
+                    
+                    # Try inserting the first row of each batch as a test
+                    if batch and batch_count % 10 == 1:  # Test every 10th batch
+                        test_row = batch[0]
+                        logger.info(f"Testing single row insert for batch {batch_count}: DOI={test_row['doi']}")
+                        row_success = self.insert_single_row(test_row, conn)
+                        if not row_success:
+                            logger.error(f"Failed to insert test row from batch {batch_count}")
+                    
+                    # Now try the full batch
+                    try:
+                        # Get count before batch
+                        with conn.cursor() as cur:
+                            cur.execute("SELECT COUNT(*) FROM doi_urls")
+                            before_count = cur.fetchone()[0]
+                        
+                        # Insert batch
+                        rows_inserted, rows_updated = self.insert_batch(batch, conn)
+                        
+                        # Get count after batch
+                        with conn.cursor() as cur:
+                            cur.execute("SELECT COUNT(*) FROM doi_urls")
+                            after_count = cur.fetchone()[0]
+                        
+                        # Verify counts match expectations
+                        actual_diff = after_count - before_count
+                        expected_diff = rows_inserted
+                        
+                        if actual_diff != expected_diff:
+                            logger.warning(f"Count mismatch: Expected +{expected_diff} rows, got +{actual_diff} rows")
+                            logger.warning(f"Before: {before_count}, After: {after_count}, Reported inserted: {rows_inserted}")
+                        
+                        self.stats['rows_inserted'] += rows_inserted
+                        self.stats['rows_updated'] += rows_updated
+                        
+                        logger.info(f"Batch {batch_count} result: +{actual_diff} rows in database, {rows_inserted} reported inserted, {rows_updated} updated")
+                        
+                        # If no rows were inserted despite having data, try direct insertion
+                        if actual_diff == 0 and len(batch) > 0 and rows_inserted > 0:
+                            logger.warning(f"Batch {batch_count}: No rows added to database despite successful operation")
+                            logger.info("Trying direct row-by-row insertion as fallback")
+                            
+                            # Try inserting a few rows directly
+                            for i, row in enumerate(batch[:5]):  # Try first 5 rows
+                                success = self.insert_single_row(row, conn)
+                                logger.info(f"Direct insert of row {i}: {'Success' if success else 'Failed'}")
+                    
+                    except Exception as e:
+                        logger.error(f"Error processing batch {batch_count}: {e}")
+                        # Continue with next batch
+                    
+                    # Check database count periodically
+                    if batch_count % 5 == 0:
+                        with conn.cursor() as cur:
+                            cur.execute("SELECT COUNT(*) FROM doi_urls")
+                            current_count = cur.fetchone()[0]
+                            logger.info(f"Current database count: {current_count} rows (+{current_count - initial_count} from start)")
+                    
+                    # Optional: Stop after a few batches in debug mode to check what's happening
+                    # Commented out to allow full import even in debug mode
+                    # if batch_count >= 5 and logger.level == logging.DEBUG:
+                    #     logger.debug("Debug mode: stopping after 5 batches for analysis")
+                    #     break
+                
+                # Get final count
+                with conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) FROM doi_urls")
+                    final_count = cur.fetchone()[0]
+                    logger.info(f"Final database count: {final_count} rows (+{final_count - initial_count} from start)")
 
             self.stats['end_time'] = time.time()
             self.print_final_stats()
@@ -676,6 +776,178 @@ class DOIURLImporter:
         except Exception as e:
             logger.error(f"Import failed: {e}")
             raise
+
+    def test_database_connection(self):
+        """Test database connection and insertion capability"""
+        logger.info("Testing database connection and insertion...")
+        
+        test_data = {
+            'doi': '10.1234/test',
+            'url': 'https://example.com/test',
+            'pdf_url': 'https://example.com/test.pdf',
+            'location_type': 'test',
+            'is_oa': True,
+            'url_quality_score': 75
+        }
+        
+        try:
+            with self.connect_db() as conn:
+                # Check if we can connect
+                logger.info("Database connection successful")
+                
+                # Check database version
+                with conn.cursor() as cur:
+                    cur.execute("SELECT version()")
+                    version = cur.fetchone()[0]
+                    logger.info(f"PostgreSQL version: {version}")
+                
+                # Check if table exists
+                with conn.cursor() as cur:
+                    cur.execute("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'doi_urls')")
+                    table_exists = cur.fetchone()[0]
+                    logger.info(f"doi_urls table exists: {table_exists}")
+
+                    if table_exists:
+                        # Check table structure
+                        self.check_database_constraints(conn)
+
+                # Test insertion
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            INSERT INTO doi_urls (doi, url, pdf_url, location_type, is_oa, url_quality_score)
+                            VALUES (%s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (doi, url) DO UPDATE SET
+                                updated_at = CURRENT_TIMESTAMP
+                            RETURNING id
+                        """, (
+                            test_data['doi'],
+                            test_data['url'],
+                            test_data['pdf_url'],
+                            test_data['location_type'],
+                            test_data['is_oa'],
+                            test_data['url_quality_score']
+                        ))
+
+                        result = cur.fetchone()
+                        conn.commit()
+
+                        logger.info(f"Test insertion successful, row id: {result[0]}")
+
+                        # Verify the row was actually inserted
+                        cur.execute("SELECT COUNT(*) FROM doi_urls WHERE doi = %s AND url = %s",
+                                   (test_data['doi'], test_data['url']))
+                        count = cur.fetchone()[0]
+                        logger.info(f"Verification query found {count} matching rows")
+
+                        return count > 0
+
+                except Exception as e:
+                    conn.rollback()
+                    logger.error(f"Database test failed: {e}")
+                    return False
+                
+        except Exception as e:
+            logger.error(f"Database connection failed: {e}")
+            return False
+
+    def insert_single_row(self, row: Dict[str, Any], connection) -> bool:
+        """Insert a single row for testing purposes"""
+        logger.info(f"Inserting single test row: {row['doi']}")
+        
+        try:
+            with connection.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO doi_urls (
+                        doi, url, pdf_url, openalex_id, title, publication_year, location_type,
+                        version, license, host_type, oa_status, is_oa, url_quality_score
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (doi, url) DO UPDATE SET
+                        updated_at = CURRENT_TIMESTAMP
+                    RETURNING id
+                """, (
+                    row['doi'],
+                    row['url'],
+                    row.get('pdf_url'),
+                    row.get('openalex_id'),
+                    row.get('title'),
+                    row.get('publication_year'),
+                    row.get('location_type', 'unknown'),
+                    row.get('version'),
+                    row.get('license'),
+                    row.get('host_type'),
+                    row.get('oa_status'),
+                    row.get('is_oa', False),
+                    row.get('url_quality_score', 50)
+                ))
+                
+                result = cur.fetchone()
+                connection.commit()
+                
+                logger.info(f"Single row insert result: {result}")
+                return True
+                
+        except Exception as e:
+            connection.rollback()
+            logger.error(f"Single row insert failed: {e}")
+            return False
+
+    def check_database_constraints(self, connection):
+        """Check database constraints that might be preventing inserts"""
+        logger.info("Checking database constraints...")
+        
+        try:
+            with connection.cursor(cursor_factory=RealDictCursor) as cur:
+                # Check table definition
+                cur.execute("""
+                    SELECT column_name, data_type, is_nullable
+                    FROM information_schema.columns
+                    WHERE table_name = 'doi_urls'
+                    ORDER BY ordinal_position
+                """)
+                columns = cur.fetchall()
+                logger.info("Table structure:")
+                for col in columns:
+                    logger.info(f"  {col['column_name']}: {col['data_type']} (nullable: {col['is_nullable']})")
+                
+                # Check constraints
+                cur.execute("""
+                    SELECT conname, contype, pg_get_constraintdef(oid) as def
+                    FROM pg_constraint
+                    WHERE conrelid = 'doi_urls'::regclass
+                """)
+                constraints = cur.fetchall()
+                logger.info("Table constraints:")
+                for con in constraints:
+                    logger.info(f"  {con['conname']} ({con['contype']}): {con['def']}")
+                
+                # Check indexes
+                cur.execute("""
+                    SELECT indexname, indexdef
+                    FROM pg_indexes
+                    WHERE tablename = 'doi_urls'
+                """)
+                indexes = cur.fetchall()
+                logger.info("Table indexes:")
+                for idx in indexes:
+                    logger.info(f"  {idx['indexname']}: {idx['indexdef']}")
+                
+                # Check for triggers
+                cur.execute("""
+                    SELECT trigger_name, action_statement
+                    FROM information_schema.triggers
+                    WHERE event_object_table = 'doi_urls'
+                """)
+                triggers = cur.fetchall()
+                logger.info("Table triggers:")
+                for trig in triggers:
+                    logger.info(f"  {trig['trigger_name']}: {trig['action_statement']}")
+                
+                return True
+                
+        except Exception as e:
+            logger.error(f"Error checking database constraints: {e}")
+            return False
 
 
 def main():
@@ -696,8 +968,18 @@ def main():
                         help='Batch size for bulk inserts (default: 10000)')
     parser.add_argument('--skip-create-tables', action='store_true',
                         help='Skip table creation (tables already exist)')
+    parser.add_argument('--test-only', action='store_true',
+                        help='Only test database connection and exit')
+    parser.add_argument('--debug', action='store_true',
+                        help='Enable debug logging')
     
     args = parser.parse_args()
+    
+    # Set debug logging if requested
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
+        for handler in logger.handlers:
+            handler.setLevel(logging.DEBUG)
     
     # Database configuration
     db_config = {
@@ -708,7 +990,7 @@ def main():
         'password': args.db_password
     }
     
-    # Create importer and run
+    # Create importer
     importer = DOIURLImporter(
         db_config=db_config,
         csv_file=args.csv_file,
@@ -716,6 +998,13 @@ def main():
         create_tables=not args.skip_create_tables
     )
     
+    # Test database connection
+    if args.test_only or args.debug:
+        success = importer.test_database_connection()
+        if args.test_only:
+            sys.exit(0 if success else 1)
+    
+    # Run the import
     importer.run_import()
 
 
