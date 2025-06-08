@@ -2,6 +2,8 @@
 
 A comprehensive system for mirroring open access URLs for scientific publications on a local PostgreSQL server. This project extracts DOI-URL mappings from OpenAlex snapshots and provides efficient tools for processing, importing, and managing large-scale academic publication data.
 
+![Paywall Breaker Sketch](assets/paywallbreaker_sketch_small.png)
+
 ## Overview
 
 Local Unpaywall creates a local mirror of open access publication URLs by:
