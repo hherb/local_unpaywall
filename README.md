@@ -19,6 +19,7 @@ The system is designed to handle massive datasets (hundreds of GB) efficiently w
 
 - **OpenAlex URL Extractor** (`openalex_unpaywall_extractor.py`): Extracts DOI-URL pairs from OpenAlex snapshots
 - **DOI-URL Importer** (`doi_url_importer.py`): Imports extracted data into PostgreSQL
+- **PDF Fetcher** (`pdf_fetcher.py`): Downloads PDF files from URLs with progress tracking and resume capability
 - **File Tracking System** (`helpers/file_tracker.py`): SQLite-based tracking for incremental processing
 - **CSV Processing Utilities** (`helpers/csv_utils.py`): Memory-efficient processing of large CSV files
 
@@ -26,8 +27,10 @@ The system is designed to handle massive datasets (hundreds of GB) efficiently w
 
 ```
 OpenAlex Snapshot → URL Extractor → CSV File → Database Importer → PostgreSQL
-                         ↓
-                  File Tracker (SQLite)
+                         ↓                              ↓
+                  File Tracker (SQLite)          PDF Fetcher
+                                                      ↓
+                                               Downloaded PDFs
 ```
 
 ## Main Scripts
@@ -96,6 +99,79 @@ python doi_url_importer.py \
     --batch-size 10000
 ```
 
+### 3. PDF Fetcher
+
+**File**: `pdf_fetcher.py`
+
+Downloads PDF files from URLs with progress tracking, resume capability, and robust error handling.
+
+**Key Features**:
+- Downloads PDFs from specified URLs with tqdm progress bars
+- Resume capability for interrupted downloads using HTTP range requests
+- PDF content validation to ensure downloaded files are actually PDFs
+- Flexible filename handling (custom names or extracted from URLs)
+- Robust error handling for network issues and file I/O
+- Command-line interface and Python module usage
+
+**Command-Line Usage**:
+```bash
+# Basic download with original filename
+python pdf_fetcher.py "https://example.com/paper.pdf" "./downloads/"
+
+# Download with custom filename
+python pdf_fetcher.py "https://example.com/paper.pdf" "./downloads/" --filename "my_paper.pdf"
+
+# Download with custom settings
+python pdf_fetcher.py "https://example.com/paper.pdf" "./downloads/" \
+    --chunk-size 16384 \
+    --timeout 60 \
+    --verbose
+```
+
+**Python Module Usage**:
+```python
+from pdf_fetcher import PDFFetcher
+
+# Create fetcher instance
+fetcher = PDFFetcher()
+
+# Download a PDF
+success, message = fetcher.download_pdf(
+    url="https://example.com/paper.pdf",
+    output_dir="./downloads/",
+    filename="my_paper.pdf"  # Optional
+)
+
+if success:
+    print(f"Success: {message}")
+else:
+    print(f"Error: {message}")
+```
+
+**Batch Download Example**:
+```python
+# Download PDFs from database URLs
+import sqlite3
+from pdf_fetcher import PDFFetcher
+
+fetcher = PDFFetcher()
+conn = sqlite3.connect("papers.db")
+
+cursor = conn.execute("SELECT doi, pdf_url FROM papers WHERE pdf_downloaded = 0")
+for doi, pdf_url in cursor:
+    filename = f"{doi.replace('/', '_')}.pdf"
+    success, message = fetcher.download_pdf(pdf_url, "./pdfs/", filename)
+
+    if success:
+        conn.execute("UPDATE papers SET pdf_downloaded = 1 WHERE doi = ?", (doi,))
+        conn.commit()
+        print(f"✓ Downloaded: {doi}")
+    else:
+        print(f"✗ Failed: {doi} - {message}")
+
+conn.close()
+```
+
 ## Database Schema
 
 The system creates optimized PostgreSQL tables for fast DOI-URL lookups:
@@ -140,7 +216,7 @@ CREATE INDEX idx_doi_urls_oa_status ON doi_urls(oa_status) WHERE is_oa = TRUE;
 
 1. **Install Dependencies**:
 ```bash
-pip install psycopg2-binary tqdm
+pip install psycopg2-binary tqdm requests
 ```
 
 2. **Set up PostgreSQL Database**:
@@ -229,6 +305,33 @@ SELECT url, pdf_url, url_quality_score, location_type
 FROM doi_urls
 WHERE doi = '10.1038/s41586-021-03819-2'
 ORDER BY url_quality_score DESC;
+```
+
+### Step 5: Download PDFs (Optional)
+
+Use the PDF fetcher to download full-text PDFs:
+
+```bash
+# Download a single PDF
+python pdf_fetcher.py "https://example.com/paper.pdf" "./downloads/" --filename "paper.pdf"
+
+# Batch download from database
+python -c "
+from pdf_fetcher import PDFFetcher
+import psycopg2
+
+fetcher = PDFFetcher()
+conn = psycopg2.connect('dbname=biomedical user=myuser password=mypass')
+cursor = conn.cursor()
+
+cursor.execute('SELECT doi, pdf_url FROM doi_urls WHERE pdf_url IS NOT NULL LIMIT 100')
+for doi, pdf_url in cursor:
+    filename = f'{doi.replace(\"/\", \"_\")}.pdf'
+    success, message = fetcher.download_pdf(pdf_url, './pdfs/', filename)
+    print(f'{'✓' if success else '✗'} {doi}: {message}')
+
+conn.close()
+"
 ```
 
 ## Advanced Features
@@ -537,6 +640,7 @@ local_unpaywall/
 ├── doi_url_schema.sql                  # Database schema
 ├── openalex_unpaywall_extractor.py     # Main extraction script
 ├── doi_url_importer.py                 # Database import script
+├── pdf_fetcher.py                      # PDF download utility
 ├── helpers/                            # Utility modules
 │   ├── __init__.py
 │   ├── file_tracker.py                 # File tracking system
@@ -544,12 +648,14 @@ local_unpaywall/
 ├── manual/                             # Documentation
 │   ├── file_tracking_system.md
 │   ├── memory_efficient_csv_processing.md
+│   ├── pdf_fetcher.md
 │   └── testing_guide.md
 └── test/                               # Test suite
     ├── __init__.py
     ├── run_all_tests.py
     ├── test_file_tracker.py
     ├── test_csv_utils.py
+    ├── test_pdf_fetcher.py
     └── test_integration.py
 ```
 
@@ -560,6 +666,7 @@ local_unpaywall/
 - **Python 3.12+**: Core runtime
 - **psycopg2-binary**: PostgreSQL adapter
 - **tqdm**: Progress bars and monitoring
+- **requests**: HTTP client for PDF downloads
 
 ### Optional Dependencies
 
@@ -570,7 +677,7 @@ local_unpaywall/
 
 ```bash
 # Using pip
-pip install psycopg2-binary tqdm
+pip install psycopg2-binary tqdm requests
 
 # Using uv (recommended)
 uv sync
@@ -620,7 +727,12 @@ This project is licensed under the MIT License. See the LICENSE file for details
 
 ## Support and Documentation
 
-- **Manual**: Detailed documentation in the `manual/` directory
+- **Manual**: Detailed technical documentation in the `manual/` directory:
+  - [File Tracking System](manual/file_tracking_system.md)
+  - [Memory-Efficient CSV Processing](manual/memory_efficient_csv_processing.md)
+  - [PDF Fetcher Utility](manual/pdf_fetcher.md)
+  - [Testing Guide](manual/testing_guide.md)
+  - [Complete Manual Index](manual/README.md)
 - **Tests**: Comprehensive test suite in the `test/` directory
 - **Logs**: Check `*.log` files for detailed processing information
 - **Issues**: Report bugs and feature requests through the project repository
