@@ -11,17 +11,40 @@ Features:
 - Data validation and cleaning
 - Duplicate handling with upsert capability
 - Progress tracking and logging
-- Resume functionality for interrupted imports
+- Resume functionality for interrupted imports with file integrity checking
 - URL quality scoring based on source characteristics
+- Import history tracking and monitoring
+- .env file support for database credentials
+
+Database Configuration:
+    The script supports two ways to provide database credentials:
+
+    1. Command line arguments (takes precedence):
+       --db-host, --db-port, --db-name, --db-user, --db-password
+
+    2. .env file with the following variables:
+       POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD
+
+    If a .env file is present, database arguments become optional on the command line.
+    Command line arguments always override .env file values.
 
 Usage:
-    python import_doi_urls.py --csv-file doi_urls.csv --db-name biomedical 
-                              --db-user myuser --db-password mypass
+    # With command line arguments
+    python doi_url_importer.py --csv-file doi_urls.csv --db-name biomedical
+                               --db-user myuser --db-password mypass
+
+    # With .env file (database args optional)
+    python doi_url_importer.py --csv-file doi_urls.csv
+
+    # Resume interrupted import
+    python doi_url_importer.py --csv-file doi_urls.csv --resume
 """
 
 import argparse
 import csv
+import hashlib
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -37,11 +60,25 @@ except ImportError:
 
 try:
     import psycopg2
-    from psycopg2 import sql
-    from psycopg2.extras import execute_values, RealDictCursor
+    from psycopg2.extras import RealDictCursor
 except ImportError:
     print("Error: psycopg2 not found. Install with: pip install psycopg2-binary")
     sys.exit(1)
+
+# Try to import python-dotenv for .env file support
+try:
+    from dotenv import load_dotenv
+    DOTENV_AVAILABLE = True
+except ImportError:
+    DOTENV_AVAILABLE = False
+
+# Import database creation utilities
+try:
+    from db.create_db import DatabaseCreator
+except ImportError:
+    # Fallback for when running from different directory
+    sys.path.append(str(Path(__file__).parent))
+    from db.create_db import DatabaseCreator
 
 # Set up logging
 logging.basicConfig(
@@ -54,14 +91,76 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def load_env_config() -> Optional[Dict[str, str]]:
+    """
+    Load database configuration from .env file if available.
+
+    Returns:
+        Dictionary with database configuration or None if .env not available
+    """
+    if not DOTENV_AVAILABLE:
+        return None
+
+    env_file = Path('.env')
+    if not env_file.exists():
+        return None
+
+    # Load .env file
+    load_dotenv(env_file)
+
+    # Extract database configuration
+    config = {}
+    env_mappings = {
+        'host': 'POSTGRES_HOST',
+        'port': 'POSTGRES_PORT',
+        'database': 'POSTGRES_DB',
+        'user': 'POSTGRES_USER',
+        'password': 'POSTGRES_PASSWORD'
+    }
+
+    for config_key, env_key in env_mappings.items():
+        value = os.getenv(env_key)
+        if value:
+            config[config_key] = value
+
+    # Convert port to integer if present
+    if 'port' in config:
+        try:
+            config['port'] = int(config['port'])
+        except ValueError:
+            logger.warning(f"Invalid port value in .env: {config['port']}")
+            del config['port']
+
+    return config if config else None
+
+
 class DOIURLImporter:
-    def __init__(self, db_config: Dict[str, str], csv_file: str, 
-                 batch_size: int = 10000, create_tables: bool = True):
+    def __init__(self, db_config: Dict[str, Any], csv_file: str,
+                 batch_size: int = 10000, create_tables: bool = True, resume: bool = False):
         self.db_config = db_config
         self.csv_file = Path(csv_file)
         self.batch_size = batch_size
         self.create_tables = create_tables
-        
+        self.resume = resume
+
+        # Resume state
+        self.import_id = None
+        self.csv_file_hash = None
+        self.start_row = 0  # Row number to start from (0-based, excluding header)
+        self.total_csv_rows = 0
+
+        # Lookup table caches for normalized database
+        self.lookup_caches = {
+            'license': {},
+            'oa_status': {},
+            'host_type': {},
+            'work_type': {}
+        }
+
+        # Track if indexes are disabled for bulk import performance
+        self.indexes_disabled = False
+
         # Statistics
         self.stats = {
             'total_rows_processed': 0,
@@ -72,7 +171,10 @@ class DOIURLImporter:
             'batch_duplicates': 0,  # Duplicates found within batches
             'invalid_urls': 0,
             'start_time': None,
-            'end_time': None
+            'end_time': None,
+            'resumed_from_row': 0,
+            'cache_hits': 0,
+            'cache_misses': 0
         }
 
     def connect_db(self):
@@ -84,109 +186,346 @@ class DOIURLImporter:
             logger.error(f"Database connection failed: {e}")
             raise
 
-    def create_schema(self):
-        """Create the DOI-URL mapping tables with error handling"""
-        logger.info("Creating DOI-URL schema...")
-        
-        # First check if tables already exist
-        with self.connect_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT EXISTS (
-                        SELECT FROM information_schema.tables 
-                        WHERE table_name = 'doi_urls'
-                    )
-                """)
-                table_exists = cur.fetchone()[0]
-                
-                if table_exists:
-                    logger.info("doi_urls table already exists")
-                    # Check if it has the unique constraint
-                    cur.execute("""
-                        SELECT COUNT(*) FROM pg_constraint 
-                        WHERE conname = 'unique_doi_url' AND conrelid = 'doi_urls'::regclass
-                    """)
-                    has_constraint = cur.fetchone()[0] > 0
-                    
-                    if not has_constraint:
-                        logger.warning("unique_doi_url constraint missing - will add it")
-                else:
-                    logger.info("doi_urls table does not exist - will create it")
-        
-        # Create tables with explicit transaction handling
+    def get_or_create_lookup_id(self, table_name: str, value: str) -> Optional[int]:
+        """
+        Get or create a lookup table entry and return its ID with caching.
+
+        Args:
+            table_name: Name of the lookup table (license, oa_status, host_type, work_type)
+            value: The value to look up or create
+
+        Returns:
+            The ID of the lookup entry, or None if value is empty
+        """
+        if not value or not value.strip():
+            return None
+
+        value = value.strip()
+
+        # Check cache first
+        if value in self.lookup_caches[table_name]:
+            self.stats['cache_hits'] += 1
+            return self.lookup_caches[table_name][value]
+
+        self.stats['cache_misses'] += 1
+
         with self.connect_db() as conn:
             with conn.cursor() as cur:
                 try:
-                    # Create main table if it doesn't exist
-                    if not table_exists:
-                        cur.execute("""
-                        CREATE TABLE IF NOT EXISTS doi_urls (
-                            id BIGSERIAL PRIMARY KEY,
-                            doi TEXT NOT NULL,
-                            url TEXT NOT NULL,
-                            pdf_url TEXT,
-                            openalex_id TEXT,
-                            title TEXT,
-                            publication_year INTEGER,
-                            location_type TEXT NOT NULL,
-                            version TEXT,
-                            license TEXT,
-                            host_type TEXT,
-                            oa_status TEXT,
-                            is_oa BOOLEAN DEFAULT FALSE,
-                            url_quality_score INTEGER DEFAULT 50,
-                            last_verified TIMESTAMP,
-                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                        )
-                        """)
-                        logger.info("Created doi_urls table")
-                    
-                    # Create indexes
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_doi_urls_doi ON doi_urls(doi)")
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_doi_urls_url ON doi_urls(url)")
-                    
-                    # Add unique constraint if it doesn't exist
-                    if not table_exists or not has_constraint:
-                        try:
-                            cur.execute("ALTER TABLE doi_urls ADD CONSTRAINT unique_doi_url UNIQUE(doi, url)")
-                            logger.info("Added unique_doi_url constraint")
-                        except psycopg2.Error as e:
-                            if "already exists" in str(e):
-                                logger.info("unique_doi_url constraint already exists")
-                            else:
-                                raise
-                    
-                    # Create metadata table
-                    cur.execute("""
-                    CREATE TABLE IF NOT EXISTS doi_metadata (
-                        doi TEXT PRIMARY KEY,
-                        openalex_id TEXT UNIQUE,
-                        title TEXT,
-                        publication_year INTEGER,
-                        work_type TEXT,
-                        is_retracted BOOLEAN DEFAULT FALSE,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                    """)
-                    
-                    # Commit all changes
+                    # Try to get existing ID
+                    cur.execute(f"""
+                    SELECT id FROM unpaywall.{table_name} WHERE value = %s
+                    """, (value,))
+
+                    result = cur.fetchone()
+                    if result:
+                        lookup_id = result[0]
+                        self.lookup_caches[table_name][value] = lookup_id
+                        return lookup_id
+
+                    # Create new entry
+                    cur.execute(f"""
+                    INSERT INTO unpaywall.{table_name} (value)
+                    VALUES (%s) RETURNING id
+                    """, (value,))
+
+                    new_id = cur.fetchone()[0]
                     conn.commit()
-                    logger.info("Schema created successfully")
-                    
-                    # Verify tables exist
-                    cur.execute("SELECT COUNT(*) FROM doi_urls")
-                    count = cur.fetchone()[0]
-                    logger.info(f"doi_urls table exists with {count} rows")
-                    
+
+                    # Cache the new ID
+                    self.lookup_caches[table_name][value] = new_id
+                    return new_id
+
                 except psycopg2.Error as e:
                     conn.rollback()
-                    logger.error(f"Schema creation failed: {e}")
-                    raise
+                    logger.error(f"Failed to get/create lookup ID for {table_name}.{value}: {e}")
+                    return None
+
+    def preload_lookup_caches(self):
+        """
+        Preload all lookup table caches to improve import performance.
+        """
+        logger.info("Preloading lookup table caches...")
+
+        with self.connect_db() as conn:
+            with conn.cursor() as cur:
+                for table_name in self.lookup_caches.keys():
+                    try:
+                        cur.execute(f"SELECT id, value FROM unpaywall.{table_name}")
+                        results = cur.fetchall()
+
+                        for lookup_id, value in results:
+                            self.lookup_caches[table_name][value] = lookup_id
+
+                        logger.info(f"Preloaded {len(results)} entries for {table_name}")
+
+                    except psycopg2.Error as e:
+                        logger.warning(f"Failed to preload cache for {table_name}: {e}")
+
+        total_cached = sum(len(cache) for cache in self.lookup_caches.values())
+        logger.info(f"Total lookup entries cached: {total_cached}")
+
+    def normalize_location_type(self, location_type: str) -> str:
+        """
+        Convert location type text to single character format.
+
+        Args:
+            location_type: Text location type (primary, alternate, best_oa, etc.)
+
+        Returns:
+            Single character: 'p' for primary, 'a' for alternate, 'b' for best_oa
+        """
+        if not location_type:
+            return 'p'  # Default to primary
+
+        location_type = location_type.lower().strip()
+
+        # Map common variations
+        if location_type in ['primary', 'p']:
+            return 'p'
+        elif location_type in ['alternate', 'alternative', 'a']:
+            return 'a'
+        elif location_type in ['best_oa', 'best', 'b']:
+            return 'b'
+        else:
+            logger.warning(f"Unknown location type '{location_type}', defaulting to 'p'")
+            return 'p'
+
+    def disable_indexes_for_bulk_import(self):
+        """
+        Disable non-essential indexes during bulk import for better performance.
+        Keeps primary key and unique constraints but drops other indexes.
+        """
+        if self.indexes_disabled:
+            return
+
+        logger.info("Disabling indexes for bulk import performance...")
+
+        # List of indexes to disable (non-essential ones)
+        indexes_to_disable = [
+            'idx_unpaywall_doi_urls_doi',
+            'idx_unpaywall_doi_urls_url',
+            'idx_unpaywall_doi_urls_pdf_url',
+            'idx_unpaywall_doi_urls_doi_location_type',
+            'idx_unpaywall_doi_urls_license_id',
+            'idx_unpaywall_doi_urls_oa_status_id',
+            'idx_unpaywall_doi_urls_host_type_id',
+            'idx_unpaywall_doi_urls_work_type_id',
+            'idx_unpaywall_doi_urls_location_type',
+            'idx_unpaywall_doi_urls_publication_year',
+            'idx_unpaywall_doi_urls_is_retracted',
+            'idx_unpaywall_doi_urls_openalex_work_id'
+        ]
+
+        with self.connect_db() as conn:
+            with conn.cursor() as cur:
+                disabled_count = 0
+                for index_name in indexes_to_disable:
+                    try:
+                        # Check if index exists first
+                        cur.execute("""
+                        SELECT 1 FROM pg_indexes
+                        WHERE schemaname = 'unpaywall'
+                        AND tablename = 'doi_urls'
+                        AND indexname = %s
+                        """, (index_name,))
+
+                        if cur.fetchone():
+                            cur.execute(f"DROP INDEX IF EXISTS unpaywall.{index_name}")
+                            disabled_count += 1
+                            logger.debug(f"Disabled index: {index_name}")
+
+                    except psycopg2.Error as e:
+                        logger.warning(f"Failed to disable index {index_name}: {e}")
+
+                conn.commit()
+                logger.info(f"Disabled {disabled_count} indexes for bulk import")
+                self.indexes_disabled = True
+
+    def recreate_indexes_after_import(self):
+        """
+        Recreate indexes after bulk import is complete.
+        """
+        if not self.indexes_disabled:
+            return
+
+        logger.info("Recreating indexes after bulk import...")
+
+        # Index definitions to recreate
+        index_definitions = [
+            ("idx_unpaywall_doi_urls_doi", "CREATE INDEX idx_unpaywall_doi_urls_doi ON unpaywall.doi_urls(doi)"),
+            ("idx_unpaywall_doi_urls_url", "CREATE INDEX idx_unpaywall_doi_urls_url ON unpaywall.doi_urls(url)"),
+            ("idx_unpaywall_doi_urls_pdf_url", "CREATE INDEX idx_unpaywall_doi_urls_pdf_url ON unpaywall.doi_urls(pdf_url) WHERE pdf_url IS NOT NULL"),
+            ("idx_unpaywall_doi_urls_doi_location_type", "CREATE INDEX idx_unpaywall_doi_urls_doi_location_type ON unpaywall.doi_urls(doi, location_type)"),
+            ("idx_unpaywall_doi_urls_license_id", "CREATE INDEX idx_unpaywall_doi_urls_license_id ON unpaywall.doi_urls(license_id)"),
+            ("idx_unpaywall_doi_urls_oa_status_id", "CREATE INDEX idx_unpaywall_doi_urls_oa_status_id ON unpaywall.doi_urls(oa_status_id)"),
+            ("idx_unpaywall_doi_urls_host_type_id", "CREATE INDEX idx_unpaywall_doi_urls_host_type_id ON unpaywall.doi_urls(host_type_id)"),
+            ("idx_unpaywall_doi_urls_work_type_id", "CREATE INDEX idx_unpaywall_doi_urls_work_type_id ON unpaywall.doi_urls(work_type_id)"),
+            ("idx_unpaywall_doi_urls_location_type", "CREATE INDEX idx_unpaywall_doi_urls_location_type ON unpaywall.doi_urls(location_type)"),
+            ("idx_unpaywall_doi_urls_publication_year", "CREATE INDEX idx_unpaywall_doi_urls_publication_year ON unpaywall.doi_urls(publication_year)"),
+            ("idx_unpaywall_doi_urls_is_retracted", "CREATE INDEX idx_unpaywall_doi_urls_is_retracted ON unpaywall.doi_urls(is_retracted)"),
+            ("idx_unpaywall_doi_urls_openalex_work_id", "CREATE INDEX idx_unpaywall_doi_urls_openalex_work_id ON unpaywall.doi_urls(openalex_id)")
+        ]
+
+        with self.connect_db() as conn:
+            with conn.cursor() as cur:
+                recreated_count = 0
+                for index_name, index_sql in index_definitions:
+                    try:
+                        cur.execute(index_sql)
+                        recreated_count += 1
+                        logger.debug(f"Recreated index: {index_name}")
+
+                    except psycopg2.Error as e:
+                        logger.warning(f"Failed to recreate index {index_name}: {e}")
+
+                conn.commit()
+                logger.info(f"Recreated {recreated_count} indexes after bulk import")
+                self.indexes_disabled = False
+
+    def _calculate_file_hash(self) -> str:
+        """Calculate SHA-256 hash of the CSV file for change detection"""
+        hash_sha256 = hashlib.sha256()
+        with open(self.csv_file, 'rb') as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_sha256.update(chunk)
+        return hash_sha256.hexdigest()
+
+    def _count_csv_rows(self) -> int:
+        """Count total rows in CSV file (excluding header)"""
+        with open(self.csv_file, 'r', encoding='utf-8') as f:
+            return sum(1 for _ in f) - 1  # Subtract 1 for header
+
+    def _generate_import_id(self) -> str:
+        """Generate unique import ID based on file path and timestamp"""
+        import uuid
+        return f"{self.csv_file.stem}_{int(time.time())}_{str(uuid.uuid4())[:8]}"
+
+    def create_schema(self):
+        """Create the DOI-URL mapping tables using the centralized DatabaseCreator"""
+        logger.info("Creating DOI-URL schema using DatabaseCreator...")
+
+        try:
+            # Create DatabaseCreator instance with the same connection config
+            creator = DatabaseCreator(**self.db_config)
+
+            # Create the complete schema
+            success = creator.create_complete_schema(verify=True)
+
+            if not success:
+                raise RuntimeError("Schema creation failed")
+
+            logger.info("Schema creation completed successfully")
+
+        except Exception as e:
+            logger.error(f"Schema creation failed: {e}")
+            raise
+
+    def _check_existing_import(self) -> Optional[Dict[str, Any]]:
+        """Check if there's an existing incomplete import for this file"""
+        with self.connect_db() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT * FROM unpaywall.import_progress
+                    WHERE csv_file_path = %s AND status = 'in_progress'
+                    ORDER BY start_time DESC LIMIT 1
+                """, (str(self.csv_file),))
+                return cur.fetchone()
+
+    def _create_import_record(self) -> str:
+        """Create a new import progress record"""
+        import_id = self._generate_import_id()
+
+        with self.connect_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO unpaywall.import_progress
+                    (import_id, csv_file_path, csv_file_hash, total_rows, status)
+                    VALUES (%s, %s, %s, %s, 'in_progress')
+                """, (import_id, str(self.csv_file), self.csv_file_hash, self.total_csv_rows))
+                conn.commit()
+
+        logger.info(f"Created import record: {import_id}")
+        return import_id
+
+    def _update_import_progress(self, processed_rows: int, batch_id: int):
+        """Update import progress"""
+        with self.connect_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE unpaywall.import_progress
+                    SET processed_rows = %s, last_batch_id = %s, updated_at = CURRENT_TIMESTAMP
+                    WHERE import_id = %s
+                """, (processed_rows, batch_id, self.import_id))
+                conn.commit()
+
+    def _complete_import(self, success: bool = True, error_message: Optional[str] = None):
+        """Mark import as completed or failed"""
+        status = 'completed' if success else 'failed'
+
+        with self.connect_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE unpaywall.import_progress
+                    SET status = %s, end_time = CURRENT_TIMESTAMP, error_message = %s, updated_at = CURRENT_TIMESTAMP
+                    WHERE import_id = %s
+                """, (status, error_message, self.import_id))
+                conn.commit()
+
+        logger.info(f"Import {self.import_id} marked as {status}")
+
+    def _setup_resume_state(self):
+        """Setup resume state by checking for existing imports"""
+        self.csv_file_hash = self._calculate_file_hash()
+        self.total_csv_rows = self._count_csv_rows()
+
+        if self.resume:
+            existing_import = self._check_existing_import()
+
+            if existing_import:
+                # Check if file has changed
+                if existing_import['csv_file_hash'] != self.csv_file_hash:
+                    logger.warning(f"CSV file has changed since last import (hash mismatch)")
+                    logger.warning(f"Previous hash: {existing_import['csv_file_hash']}")
+                    logger.warning(f"Current hash: {self.csv_file_hash}")
+
+                    response = input("File has changed. Continue with new import? (y/N): ")
+                    if response.lower() != 'y':
+                        logger.info("Import cancelled by user")
+                        sys.exit(0)
+
+                    # Mark old import as cancelled and start new one
+                    with self.connect_db() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute("""
+                                UPDATE unpaywall.import_progress
+                                SET status = 'cancelled', end_time = CURRENT_TIMESTAMP,
+                                    error_message = 'File changed, new import started'
+                                WHERE import_id = %s
+                            """, (existing_import['import_id'],))
+                            conn.commit()
+
+                    self.import_id = self._create_import_record()
+                    self.start_row = 0
+                else:
+                    # Resume from existing import
+                    self.import_id = existing_import['import_id']
+                    self.start_row = existing_import['processed_rows']
+                    self.stats['resumed_from_row'] = self.start_row
+
+                    logger.info(f"Resuming import {self.import_id} from row {self.start_row}")
+                    logger.info(f"Progress: {self.start_row}/{self.total_csv_rows} rows ({self.start_row/self.total_csv_rows*100:.1f}%)")
+            else:
+                logger.info("No existing incomplete import found, starting new import")
+                self.import_id = self._create_import_record()
+                self.start_row = 0
+        else:
+            # Not resuming, start fresh
+            self.import_id = self._create_import_record()
+            self.start_row = 0
 
     def validate_and_clean_row(self, row: Dict[str, str]) -> Optional[Dict[str, Any]]:
-        """Validate and clean a single CSV row"""
+        """Validate and clean a single CSV row for normalized database structure"""
 
         # Required fields
         doi_raw = row.get('doi', '').strip()
@@ -208,20 +547,31 @@ class DOIURLImporter:
             logger.warning(f"Invalid URL: {url}")
             return None
 
-        # Clean and convert data
+        # Convert text values to foreign key IDs using cached lookups
+        license_id = self.get_or_create_lookup_id('license', row.get('license', '').strip())
+        oa_status_id = self.get_or_create_lookup_id('oa_status', row.get('oa_status', '').strip())
+        host_type_id = self.get_or_create_lookup_id('host_type', row.get('host_type', '').strip())
+        work_type_id = self.get_or_create_lookup_id('work_type', row.get('work_type', '').strip())
+
+        # Normalize location type to single character
+        normalized_location_type = self.normalize_location_type(location_type)
+
+        # Clean and convert data for normalized structure
         cleaned_row = {
             'doi': doi_identifier.lower(),  # Store just the DOI identifier, normalized
             'url': url,
             'pdf_url': row.get('pdf_url', '').strip() or None,
-            'openalex_id': row.get('openalex_id', '').strip() or None,
+            'openalex_id': self._safe_openalex_id(row.get('openalex_id', '')),
             'title': row.get('title', '').strip() or None,
             'publication_year': self._safe_int(row.get('publication_year', '')),
-            'location_type': location_type.lower(),
+            'location_type': normalized_location_type,  # Single character format
             'version': row.get('version', '').strip() or None,
-            'license': row.get('license', '').strip() or None,
-            'host_type': row.get('host_type', '').strip() or None,
-            'oa_status': row.get('oa_status', '').strip() or None,
+            'license_id': license_id,  # Foreign key ID instead of text
+            'host_type_id': host_type_id,  # Foreign key ID instead of text
+            'oa_status_id': oa_status_id,  # Foreign key ID instead of text
             'is_oa': self._safe_bool(row.get('is_oa', '')),
+            'work_type_id': work_type_id,  # Foreign key ID instead of text
+            'is_retracted': self._safe_bool(row.get('is_retracted', '')),
             'url_quality_score': self._calculate_url_quality_score(row)
         }
 
@@ -276,6 +626,39 @@ class DOIURLImporter:
             return False
         value_lower = value.strip().lower()
         return value_lower in ('true', '1', 'yes', 't')
+
+    def _safe_openalex_id(self, value: Optional[str]) -> Optional[int]:
+        """Safely convert OpenAlex ID to BIGINT"""
+        if not value or value.strip() == '':
+            return None
+
+        value = value.strip()
+
+        try:
+            # If it's already a number, convert directly
+            if value.isdigit():
+                return int(value)
+
+            # Handle full URLs like "https://openalex.org/W1982051859"
+            if 'openalex.org/W' in value:
+                numeric_part = value.split('openalex.org/W')[1]
+                return int(numeric_part)
+
+            # Handle W-prefixed IDs like "W1982051859"
+            elif value.startswith('W'):
+                return int(value[1:])  # Remove the 'W' prefix
+
+            # Try to extract any numeric part
+            import re
+            numeric_match = re.search(r'\d+', value)
+            if numeric_match:
+                return int(numeric_match.group())
+
+            return None
+
+        except (ValueError, TypeError, IndexError):
+            logger.warning(f"Could not convert OpenAlex ID to integer: {value}")
+            return None
 
     def _calculate_url_quality_score(self, row: Dict[str, str]) -> int:
         """Calculate quality score for URL based on various factors"""
@@ -333,8 +716,8 @@ class DOIURLImporter:
         
         return min(100, max(0, score))  # Clamp between 0-100
 
-    def read_csv_in_batches(self) -> Generator[List[Dict[str, Any]], None, None]:
-        """Memory-efficient generator that yields batches of validated rows"""
+    def read_csv_in_batches(self) -> Generator[Tuple[List[Dict[str, Any]], int], None, None]:
+        """Memory-efficient generator that yields batches of validated rows with batch info"""
         if not self.csv_file.exists():
             raise FileNotFoundError(f"CSV file not found: {self.csv_file}")
 
@@ -353,6 +736,10 @@ class DOIURLImporter:
             raise ValueError(f"CSV file has no data rows (only {line_count} line(s) found)")
 
         logger.info(f"CSV file has {line_count:,} lines")
+
+        # Calculate resume information
+        if self.start_row > 0:
+            logger.info(f"Resuming from row {self.start_row} (skipping {self.start_row} rows)")
 
         # Use comma delimiter directly as specified
         delimiter = ','
@@ -383,8 +770,9 @@ class DOIURLImporter:
                     raise ValueError("CSV file appears to be empty or has no data rows")
 
                 # Initialize progress bar
+                remaining_rows = line_count - 1 - self.start_row  # Total rows minus header minus already processed
                 progress_bar = tqdm(
-                    total=line_count - 1,  # Subtract 1 for header
+                    total=remaining_rows,
                     desc="Processing CSV",
                     unit="rows",
                     unit_scale=True
@@ -394,9 +782,15 @@ class DOIURLImporter:
                 batch_count = 0
                 valid_rows = 0
                 invalid_rows = 0
+                current_row = 0
 
                 try:
                     for row in reader:
+                        # Skip rows if resuming
+                        if current_row < self.start_row:
+                            current_row += 1
+                            continue
+
                         cleaned_row = self.validate_and_clean_row(row)
 
                         if cleaned_row:
@@ -407,20 +801,21 @@ class DOIURLImporter:
                             self.stats['rows_skipped'] += 1
 
                         self.stats['total_rows_processed'] += 1
+                        current_row += 1
                         progress_bar.update(1)
 
                         # When batch is full, yield it and start a new one
                         if len(current_batch) >= self.batch_size:
                             batch_count += 1
                             logger.info(f"Yielding batch {batch_count} with {len(current_batch)} rows")
-                            yield current_batch
+                            yield (current_batch, current_row)
                             current_batch = []
 
                     # Yield final batch if not empty
                     if current_batch:
                         batch_count += 1
                         logger.info(f"Yielding final batch {batch_count} with {len(current_batch)} rows")
-                        yield current_batch
+                        yield (current_batch, current_row)
 
                 finally:
                     progress_bar.close()
@@ -516,10 +911,10 @@ class DOIURLImporter:
         if len(deduplicated_batch) != len(batch):
             logger.debug(f"Batch size reduced from {len(batch)} to {len(deduplicated_batch)} after deduplication")
 
-        # Prepare data for bulk insert
+        # Prepare data for bulk insert with normalized structure
         insert_data = []
         for row in deduplicated_batch:
-            # Ensure all required fields are present
+            # Ensure all required fields are present for normalized structure
             insert_data.append((
                 row['doi'],
                 row['url'],
@@ -527,12 +922,14 @@ class DOIURLImporter:
                 row.get('openalex_id'),
                 row.get('title'),
                 row.get('publication_year'),
-                row.get('location_type', 'unknown'),  # Provide default for required field
+                row.get('location_type', 'p'),  # Default to 'p' for primary
                 row.get('version'),
-                row.get('license'),
-                row.get('host_type'),
-                row.get('oa_status'),
+                row.get('license_id'),  # Foreign key ID
+                row.get('host_type_id'),  # Foreign key ID
+                row.get('oa_status_id'),  # Foreign key ID
                 row.get('is_oa', False),
+                row.get('work_type_id'),  # Foreign key ID
+                row.get('is_retracted', False),
                 row.get('url_quality_score', 50)
             ))
         
@@ -542,66 +939,72 @@ class DOIURLImporter:
         try:
             with connection.cursor() as cur:
                 # Get count before insert
-                cur.execute("SELECT COUNT(*) FROM doi_urls")
+                cur.execute("SELECT COUNT(*) FROM unpaywall.doi_urls")
                 count_before = cur.fetchone()[0]
                 
                 # Use a very small chunk size for reliability
                 chunk_size = 50
-                
+                last_chunk_num = 0
+
                 for i in range(0, len(insert_data), chunk_size):
                     chunk = insert_data[i:i+chunk_size]
-                    logger.info(f"Processing chunk {i//chunk_size + 1}/{(len(insert_data) + chunk_size - 1) // chunk_size} ({len(chunk)} rows)")
-                    
+                    chunk_num = i//chunk_size + 1
+                    last_chunk_num = chunk_num
+                    total_chunks = (len(insert_data) + chunk_size - 1) // chunk_size
+                    logger.info(f"Processing chunk {chunk_num}/{total_chunks} ({len(chunk)} rows)")
+
                     # Try row-by-row insertion for maximum reliability
                     for j, row_data in enumerate(chunk):
                         try:
                             cur.execute("""
-                                INSERT INTO doi_urls (
+                                INSERT INTO unpaywall.doi_urls (
                                     doi, url, pdf_url, openalex_id, title, publication_year, location_type,
-                                    version, license, host_type, oa_status, is_oa, url_quality_score
-                                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                    version, license_id, host_type_id, oa_status_id, is_oa, work_type_id, is_retracted, url_quality_score
+                                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                                 ON CONFLICT (doi, url) DO UPDATE SET
                                     pdf_url = CASE
                                         WHEN EXCLUDED.pdf_url IS NOT NULL AND EXCLUDED.pdf_url != ''
                                         THEN EXCLUDED.pdf_url
-                                        ELSE doi_urls.pdf_url
+                                        ELSE unpaywall.doi_urls.pdf_url
                                     END,
                                     openalex_id = EXCLUDED.openalex_id,
                                     title = EXCLUDED.title,
                                     publication_year = EXCLUDED.publication_year,
                                     location_type = EXCLUDED.location_type,
                                     version = EXCLUDED.version,
-                                    license = EXCLUDED.license,
-                                    host_type = EXCLUDED.host_type,
-                                    oa_status = EXCLUDED.oa_status,
+                                    license_id = EXCLUDED.license_id,
+                                    host_type_id = EXCLUDED.host_type_id,
+                                    oa_status_id = EXCLUDED.oa_status_id,
                                     is_oa = EXCLUDED.is_oa,
+                                    work_type_id = EXCLUDED.work_type_id,
+                                    is_retracted = EXCLUDED.is_retracted,
                                     url_quality_score = EXCLUDED.url_quality_score,
                                     updated_at = CURRENT_TIMESTAMP
                                 RETURNING (xmax = 0) AS inserted
                             """, row_data)
-                            
+
                             # Check if row was inserted or updated
                             result = cur.fetchone()
                             if result and result[0]:  # xmax = 0 means inserted
                                 rows_inserted += 1
                             else:
                                 rows_updated += 1
-                            
+
                             # Commit every 10 rows
                             if (j + 1) % 10 == 0:
                                 connection.commit()
-                                
+
                         except Exception as e:
                             connection.rollback()
                             logger.error(f"Error inserting row {i+j}: {e}")
                             # Continue with next row
-                
+
                 # Commit any remaining rows in this chunk
                 connection.commit()
-                logger.info(f"Committed chunk {i//chunk_size + 1}: {rows_inserted} inserted, {rows_updated} updated so far")
+                logger.info(f"Committed chunk {last_chunk_num}: {rows_inserted} inserted, {rows_updated} updated so far")
             
-                # Get count after insert  
-                cur.execute("SELECT COUNT(*) FROM doi_urls")
+                # Get count after insert
+                cur.execute("SELECT COUNT(*) FROM unpaywall.doi_urls")
                 count_after = cur.fetchone()[0]
                 
                 # Verify counts
@@ -615,57 +1018,39 @@ class DOIURLImporter:
             logger.error(f"Batch insert failed: {e}")
             raise
 
-    def update_doi_metadata(self, connection):
-        """Update the separate doi_metadata table with aggregated information"""
-        logger.info("Updating DOI metadata table...")
-        
-        metadata_sql = """
-        INSERT INTO doi_metadata (doi, openalex_id, title, publication_year)
-        SELECT DISTINCT 
-            doi,
-            openalex_id,
-            title,
-            publication_year
-        FROM doi_urls
-        WHERE doi IS NOT NULL
-        ON CONFLICT (doi) DO UPDATE SET
-            openalex_id = EXCLUDED.openalex_id,
-            title = EXCLUDED.title,
-            publication_year = EXCLUDED.publication_year,
-            updated_at = CURRENT_TIMESTAMP;
-        """
-        
-        try:
-            with connection.cursor() as cur:
-                cur.execute(metadata_sql)
-                rows_affected = cur.rowcount
-                connection.commit()
-                logger.debug(f"Updated {rows_affected} DOI metadata records")
-        except psycopg2.Error as e:
-            connection.rollback()
-            logger.error(f"DOI metadata update failed: {e}")
+
 
     def print_final_stats(self):
-        """Print import statistics"""
+        """Print import statistics including normalized database metrics"""
         duration = self.stats['end_time'] - self.stats['start_time']
 
         print("\n" + "=" * 60)
-        print("DOI-URL IMPORT COMPLETED")
+        print("DOI-URL IMPORT COMPLETED (NORMALIZED DATABASE)")
         print("=" * 60)
+        print(f"Import ID: {self.import_id}")
+        if self.stats['resumed_from_row'] > 0:
+            print(f"Resumed from row: {self.stats['resumed_from_row']:,}")
         print(f"Total rows processed: {self.stats['total_rows_processed']:,}")
         print(f"Rows inserted: {self.stats['rows_inserted']:,}")
         print(f"Rows updated: {self.stats['rows_updated']:,}")
         print(f"Rows skipped (invalid): {self.stats['rows_skipped']:,}")
         print(f"Batch duplicates removed: {self.stats['batch_duplicates']:,}")
         print(f"Invalid URLs filtered: {self.stats['invalid_urls']:,}")
+
+        # Lookup cache statistics
+        total_cache_entries = sum(len(cache) for cache in self.lookup_caches.values())
+        cache_hit_rate = (self.stats['cache_hits'] / (self.stats['cache_hits'] + self.stats['cache_misses']) * 100) if (self.stats['cache_hits'] + self.stats['cache_misses']) > 0 else 0
+        print(f"Lookup cache entries: {total_cache_entries:,}")
+        print(f"Cache hit rate: {cache_hit_rate:.1f}% ({self.stats['cache_hits']:,} hits, {self.stats['cache_misses']:,} misses)")
+
         print(f"Import duration: {duration:.1f} seconds")
         if duration > 0:
             print(f"Processing rate: {self.stats['total_rows_processed']/duration:.1f} rows/sec")
         print("=" * 60)
 
     def run_import(self):
-        """Execute the complete import process"""
-        logger.info("Starting DOI-URL import process...")
+        """Execute the complete import process with normalized database support"""
+        logger.info("Starting DOI-URL import process with normalized database...")
         self.stats['start_time'] = time.time()
 
         try:
@@ -673,10 +1058,20 @@ class DOIURLImporter:
             if self.create_tables:
                 self.create_schema()
 
+            # Setup resume state
+            self._setup_resume_state()
+
+            # Preload lookup table caches for performance
+            self.preload_lookup_caches()
+
+            # Disable indexes for bulk import performance
+            self.disable_indexes_for_bulk_import()
+
             # Test database connection and insertion
             test_success = self.test_database_connection()
             if not test_success:
                 logger.error("Database test failed - cannot proceed with import")
+                self._complete_import(success=False, error_message="Database test failed")
                 return
 
             # Process CSV in batches using memory-efficient generator
@@ -687,7 +1082,7 @@ class DOIURLImporter:
             with self.connect_db() as conn:
                 # Get initial count
                 with conn.cursor() as cur:
-                    cur.execute("SELECT COUNT(*) FROM doi_urls")
+                    cur.execute("SELECT COUNT(*) FROM unpaywall.doi_urls")
                     initial_count = cur.fetchone()[0]
                     logger.info(f"Initial database count: {initial_count} rows")
                 
@@ -695,12 +1090,13 @@ class DOIURLImporter:
                 total_rows_processed = 0
                 
                 # Process each batch as it comes from the generator
-                for batch in batch_generator:
+                for batch_data in batch_generator:
+                    batch, current_row = batch_data
                     batch_count += 1
                     total_rows_processed += len(batch)
-                    
-                    logger.info(f"Processing batch {batch_count} with {len(batch)} rows (total processed: {total_rows_processed})")
-                    
+
+                    logger.info(f"Processing batch {batch_count} with {len(batch)} rows (total processed: {total_rows_processed}, current row: {current_row})")
+
                     # Try inserting the first row of each batch as a test
                     if batch and batch_count % 10 == 1:  # Test every 10th batch
                         test_row = batch[0]
@@ -708,20 +1104,20 @@ class DOIURLImporter:
                         row_success = self.insert_single_row(test_row, conn)
                         if not row_success:
                             logger.error(f"Failed to insert test row from batch {batch_count}")
-                    
+
                     # Now try the full batch
                     try:
                         # Get count before batch
                         with conn.cursor() as cur:
-                            cur.execute("SELECT COUNT(*) FROM doi_urls")
+                            cur.execute("SELECT COUNT(*) FROM unpaywall.doi_urls")
                             before_count = cur.fetchone()[0]
-                        
+
                         # Insert batch
                         rows_inserted, rows_updated = self.insert_batch(batch, conn)
                         
                         # Get count after batch
                         with conn.cursor() as cur:
-                            cur.execute("SELECT COUNT(*) FROM doi_urls")
+                            cur.execute("SELECT COUNT(*) FROM unpaywall.doi_urls")
                             after_count = cur.fetchone()[0]
                         
                         # Verify counts match expectations
@@ -734,27 +1130,31 @@ class DOIURLImporter:
                         
                         self.stats['rows_inserted'] += rows_inserted
                         self.stats['rows_updated'] += rows_updated
-                        
+
                         logger.info(f"Batch {batch_count} result: +{actual_diff} rows in database, {rows_inserted} reported inserted, {rows_updated} updated")
-                        
+
+                        # Update progress tracking
+                        self._update_import_progress(current_row, batch_count)
+
                         # If no rows were inserted despite having data, try direct insertion
                         if actual_diff == 0 and len(batch) > 0 and rows_inserted > 0:
                             logger.warning(f"Batch {batch_count}: No rows added to database despite successful operation")
                             logger.info("Trying direct row-by-row insertion as fallback")
-                            
+
                             # Try inserting a few rows directly
                             for i, row in enumerate(batch[:5]):  # Try first 5 rows
                                 success = self.insert_single_row(row, conn)
                                 logger.info(f"Direct insert of row {i}: {'Success' if success else 'Failed'}")
-                    
+
                     except Exception as e:
                         logger.error(f"Error processing batch {batch_count}: {e}")
-                        # Continue with next batch
+                        self._complete_import(success=False, error_message=str(e))
+                        raise
                     
                     # Check database count periodically
                     if batch_count % 5 == 0:
                         with conn.cursor() as cur:
-                            cur.execute("SELECT COUNT(*) FROM doi_urls")
+                            cur.execute("SELECT COUNT(*) FROM unpaywall.doi_urls")
                             current_count = cur.fetchone()[0]
                             logger.info(f"Current database count: {current_count} rows (+{current_count - initial_count} from start)")
                     
@@ -766,105 +1166,125 @@ class DOIURLImporter:
                 
                 # Get final count
                 with conn.cursor() as cur:
-                    cur.execute("SELECT COUNT(*) FROM doi_urls")
+                    cur.execute("SELECT COUNT(*) FROM unpaywall.doi_urls")
                     final_count = cur.fetchone()[0]
                     logger.info(f"Final database count: {final_count} rows (+{final_count - initial_count} from start)")
+
+            # Recreate indexes after bulk import
+            self.recreate_indexes_after_import()
+
+            # Mark import as completed
+            self._complete_import(success=True)
 
             self.stats['end_time'] = time.time()
             self.print_final_stats()
 
         except Exception as e:
             logger.error(f"Import failed: {e}")
+            # Try to recreate indexes even if import failed
+            try:
+                self.recreate_indexes_after_import()
+            except Exception as index_error:
+                logger.warning(f"Failed to recreate indexes after failed import: {index_error}")
+
+            self._complete_import(success=False, error_message=str(e))
             raise
 
-    def test_database_connection(self):
-        """Test database connection and insertion capability"""
-        logger.info("Testing database connection and insertion...")
-        
-        test_data = {
-            'doi': '10.1234/test',
-            'url': 'https://example.com/test',
-            'pdf_url': 'https://example.com/test.pdf',
-            'location_type': 'test',
-            'is_oa': True,
-            'url_quality_score': 75
-        }
-        
+    
+
+    def list_import_history(self, limit: int = 10):
+        """List recent import history for debugging"""
         try:
             with self.connect_db() as conn:
-                # Check if we can connect
-                logger.info("Database connection successful")
-                
-                # Check database version
-                with conn.cursor() as cur:
-                    cur.execute("SELECT version()")
-                    version = cur.fetchone()[0]
-                    logger.info(f"PostgreSQL version: {version}")
-                
-                # Check if table exists
-                with conn.cursor() as cur:
-                    cur.execute("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'doi_urls')")
-                    table_exists = cur.fetchone()[0]
-                    logger.info(f"doi_urls table exists: {table_exists}")
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("""
+                        SELECT import_id, csv_file_path, status, processed_rows, total_rows,
+                               start_time, end_time, error_message
+                        FROM unpaywall.import_progress
+                        ORDER BY start_time DESC
+                        LIMIT %s
+                    """, (limit,))
 
-                    if table_exists:
-                        # Check table structure
-                        self.check_database_constraints(conn)
+                    imports = cur.fetchall()
 
-                # Test insertion
-                try:
-                    with conn.cursor() as cur:
-                        cur.execute("""
-                            INSERT INTO doi_urls (doi, url, pdf_url, location_type, is_oa, url_quality_score)
-                            VALUES (%s, %s, %s, %s, %s, %s)
-                            ON CONFLICT (doi, url) DO UPDATE SET
-                                updated_at = CURRENT_TIMESTAMP
-                            RETURNING id
-                        """, (
-                            test_data['doi'],
-                            test_data['url'],
-                            test_data['pdf_url'],
-                            test_data['location_type'],
-                            test_data['is_oa'],
-                            test_data['url_quality_score']
-                        ))
+                    if imports:
+                        print(f"\nRecent import history (last {len(imports)} imports):")
+                        print("-" * 100)
+                        for imp in imports:
+                            progress_pct = (imp['processed_rows'] / imp['total_rows'] * 100) if imp['total_rows'] > 0 else 0
+                            print(f"ID: {imp['import_id']}")
+                            print(f"  File: {imp['csv_file_path']}")
+                            print(f"  Status: {imp['status']}")
+                            print(f"  Progress: {imp['processed_rows']:,}/{imp['total_rows']:,} ({progress_pct:.1f}%)")
+                            print(f"  Started: {imp['start_time']}")
+                            if imp['end_time']:
+                                print(f"  Ended: {imp['end_time']}")
+                            if imp['error_message']:
+                                print(f"  Error: {imp['error_message']}")
+                            print()
+                    else:
+                        print("No import history found.")
 
-                        result = cur.fetchone()
-                        conn.commit()
-
-                        logger.info(f"Test insertion successful, row id: {result[0]}")
-
-                        # Verify the row was actually inserted
-                        cur.execute("SELECT COUNT(*) FROM doi_urls WHERE doi = %s AND url = %s",
-                                   (test_data['doi'], test_data['url']))
-                        count = cur.fetchone()[0]
-                        logger.info(f"Verification query found {count} matching rows")
-
-                        return count > 0
-
-                except Exception as e:
-                    conn.rollback()
-                    logger.error(f"Database test failed: {e}")
-                    return False
-                
         except Exception as e:
-            logger.error(f"Database connection failed: {e}")
+            logger.error(f"Error listing import history: {e}")
+
+    def test_database_connection(self) -> bool:
+        """Test database connection and basic operations"""
+        try:
+            with self.connect_db() as conn:
+                with conn.cursor() as cur:
+                    # Test basic connection
+                    cur.execute("SELECT 1")
+                    result = cur.fetchone()
+                    if result[0] != 1:
+                        logger.error("Database connection test failed")
+                        return False
+
+                    # Test if unpaywall schema exists
+                    cur.execute("""
+                        SELECT EXISTS (
+                            SELECT FROM information_schema.schemata
+                            WHERE schema_name = 'unpaywall'
+                        )
+                    """)
+                    schema_exists = cur.fetchone()[0]
+                    if not schema_exists:
+                        logger.warning("unpaywall schema does not exist - will be created")
+
+                    # Test if tables exist
+                    cur.execute("""
+                        SELECT EXISTS (
+                            SELECT FROM information_schema.tables
+                            WHERE table_schema = 'unpaywall' AND table_name = 'doi_urls'
+                        )
+                    """)
+                    table_exists = cur.fetchone()[0]
+                    if not table_exists:
+                        logger.warning("unpaywall.doi_urls table does not exist - will be created")
+
+                    logger.info("Database connection test successful")
+                    return True
+
+        except Exception as e:
+            logger.error(f"Database connection test failed: {e}")
             return False
 
     def insert_single_row(self, row: Dict[str, Any], connection) -> bool:
-        """Insert a single row for testing purposes"""
-        logger.info(f"Inserting single test row: {row['doi']}")
-        
+        """Insert a single row for testing purposes with normalized structure"""
         try:
             with connection.cursor() as cur:
                 cur.execute("""
-                    INSERT INTO doi_urls (
+                    INSERT INTO unpaywall.doi_urls (
                         doi, url, pdf_url, openalex_id, title, publication_year, location_type,
-                        version, license, host_type, oa_status, is_oa, url_quality_score
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        version, license_id, host_type_id, oa_status_id, is_oa, work_type_id, is_retracted, url_quality_score
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (doi, url) DO UPDATE SET
+                        pdf_url = CASE
+                            WHEN EXCLUDED.pdf_url IS NOT NULL AND EXCLUDED.pdf_url != ''
+                            THEN EXCLUDED.pdf_url
+                            ELSE unpaywall.doi_urls.pdf_url
+                        END,
                         updated_at = CURRENT_TIMESTAMP
-                    RETURNING id
                 """, (
                     row['doi'],
                     row['url'],
@@ -872,98 +1292,59 @@ class DOIURLImporter:
                     row.get('openalex_id'),
                     row.get('title'),
                     row.get('publication_year'),
-                    row.get('location_type', 'unknown'),
+                    row.get('location_type', 'p'),  # Default to 'p' for primary
                     row.get('version'),
-                    row.get('license'),
-                    row.get('host_type'),
-                    row.get('oa_status'),
+                    row.get('license_id'),  # Foreign key ID
+                    row.get('host_type_id'),  # Foreign key ID
+                    row.get('oa_status_id'),  # Foreign key ID
                     row.get('is_oa', False),
+                    row.get('work_type_id'),  # Foreign key ID
+                    row.get('is_retracted', False),
                     row.get('url_quality_score', 50)
                 ))
-                
-                result = cur.fetchone()
                 connection.commit()
-                
-                logger.info(f"Single row insert result: {result}")
                 return True
-                
-        except Exception as e:
-            connection.rollback()
-            logger.error(f"Single row insert failed: {e}")
-            return False
 
-    def check_database_constraints(self, connection):
-        """Check database constraints that might be preventing inserts"""
-        logger.info("Checking database constraints...")
-        
-        try:
-            with connection.cursor(cursor_factory=RealDictCursor) as cur:
-                # Check table definition
-                cur.execute("""
-                    SELECT column_name, data_type, is_nullable
-                    FROM information_schema.columns
-                    WHERE table_name = 'doi_urls'
-                    ORDER BY ordinal_position
-                """)
-                columns = cur.fetchall()
-                logger.info("Table structure:")
-                for col in columns:
-                    logger.info(f"  {col['column_name']}: {col['data_type']} (nullable: {col['is_nullable']})")
-                
-                # Check constraints
-                cur.execute("""
-                    SELECT conname, contype, pg_get_constraintdef(oid) as def
-                    FROM pg_constraint
-                    WHERE conrelid = 'doi_urls'::regclass
-                """)
-                constraints = cur.fetchall()
-                logger.info("Table constraints:")
-                for con in constraints:
-                    logger.info(f"  {con['conname']} ({con['contype']}): {con['def']}")
-                
-                # Check indexes
-                cur.execute("""
-                    SELECT indexname, indexdef
-                    FROM pg_indexes
-                    WHERE tablename = 'doi_urls'
-                """)
-                indexes = cur.fetchall()
-                logger.info("Table indexes:")
-                for idx in indexes:
-                    logger.info(f"  {idx['indexname']}: {idx['indexdef']}")
-                
-                # Check for triggers
-                cur.execute("""
-                    SELECT trigger_name, action_statement
-                    FROM information_schema.triggers
-                    WHERE event_object_table = 'doi_urls'
-                """)
-                triggers = cur.fetchall()
-                logger.info("Table triggers:")
-                for trig in triggers:
-                    logger.info(f"  {trig['trigger_name']}: {trig['action_statement']}")
-                
-                return True
-                
         except Exception as e:
-            logger.error(f"Error checking database constraints: {e}")
+            logger.error(f"Single row insert failed: {e}")
+            connection.rollback()
             return False
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Import DOI-URL CSV into PostgreSQL')
+    # Check for .env configuration first
+    env_config = load_env_config()
+    env_available = env_config is not None
+
+    # Create argument parser with conditional required arguments
+    parser = argparse.ArgumentParser(
+        description='Import DOI-URL CSV into PostgreSQL',
+        epilog='Database credentials can be provided via command line arguments or .env file. '
+               'Command line arguments take precedence over .env file values.'
+    )
     parser.add_argument('--csv-file', required=True,
                         help='Path to CSV file with DOI-URL mappings')
-    parser.add_argument('--db-host', default='localhost',
-                        help='PostgreSQL host')
-    parser.add_argument('--db-port', type=int, default=5432,
-                        help='PostgreSQL port')
-    parser.add_argument('--db-name', required=True,
-                        help='PostgreSQL database name')
-    parser.add_argument('--db-user', required=True,
-                        help='PostgreSQL username')
-    parser.add_argument('--db-password', required=True,
-                        help='PostgreSQL password')
+
+    # Database arguments - make them optional if .env is available
+    parser.add_argument('--db-host',
+                        default=env_config.get('host', 'localhost') if env_available else 'localhost',
+                        help=f'PostgreSQL host (default: {"from .env" if env_available else "localhost"})')
+    parser.add_argument('--db-port', type=int,
+                        default=env_config.get('port', 5432) if env_available else 5432,
+                        help=f'PostgreSQL port (default: {"from .env" if env_available else "5432"})')
+    parser.add_argument('--db-name',
+                        required=not env_available,
+                        default=env_config.get('database') if env_available else None,
+                        help=f'PostgreSQL database name{"" if env_available else " (required)"}')
+    parser.add_argument('--db-user',
+                        required=not env_available,
+                        default=env_config.get('user') if env_available else None,
+                        help=f'PostgreSQL username{"" if env_available else " (required)"}')
+    parser.add_argument('--db-password',
+                        required=not env_available,
+                        default=env_config.get('password') if env_available else None,
+                        help=f'PostgreSQL password{"" if env_available else " (required)"}')
+
     parser.add_argument('--batch-size', type=int, default=10000,
                         help='Batch size for bulk inserts (default: 10000)')
     parser.add_argument('--skip-create-tables', action='store_true',
@@ -972,38 +1353,63 @@ def main():
                         help='Only test database connection and exit')
     parser.add_argument('--debug', action='store_true',
                         help='Enable debug logging')
-    
+    parser.add_argument('--resume', action='store_true',
+                        help='Resume from previous incomplete import')
+    parser.add_argument('--list-imports', action='store_true',
+                        help='List recent import history and exit')
+
     args = parser.parse_args()
-    
+
     # Set debug logging if requested
     if args.debug:
         logger.setLevel(logging.DEBUG)
         for handler in logger.handlers:
             handler.setLevel(logging.DEBUG)
-    
-    # Database configuration
-    db_config = {
-        'host': args.db_host,
-        'port': args.db_port,
-        'database': args.db_name,
-        'user': args.db_user,
-        'password': args.db_password
-    }
-    
+
+    # Build database configuration, prioritizing command line args over .env
+    db_config = {}
+
+    # Use command line arguments if provided, otherwise fall back to .env values
+    db_config['host'] = args.db_host
+    db_config['port'] = args.db_port
+    db_config['database'] = args.db_name
+    db_config['user'] = args.db_user
+    db_config['password'] = args.db_password
+
+    # Validate that all required database parameters are available
+    required_params = ['host', 'port', 'database', 'user', 'password']
+    missing_params = [param for param in required_params if not db_config.get(param)]
+
+    if missing_params:
+        logger.error(f"Missing required database parameters: {missing_params}")
+        if env_available:
+            logger.error("Parameters not found in command line arguments or .env file")
+        else:
+            logger.error("No .env file found and parameters not provided via command line")
+        sys.exit(1)
+
+    # Log configuration source
+    if env_available:
+        logger.info("Database configuration loaded from .env file (command line arguments take precedence)")
+    else:
+        logger.info("Database configuration loaded from command line arguments")
+
+    logger.info(f"Connecting to database: {db_config['user']}@{db_config['host']}:{db_config['port']}/{db_config['database']}")
+
     # Create importer
     importer = DOIURLImporter(
         db_config=db_config,
         csv_file=args.csv_file,
         batch_size=args.batch_size,
-        create_tables=not args.skip_create_tables
+        create_tables=not args.skip_create_tables,
+        resume=args.resume
     )
-    
-    # Test database connection
-    if args.test_only or args.debug:
-        success = importer.test_database_connection()
-        if args.test_only:
-            sys.exit(0 if success else 1)
-    
+
+    # List import history if requested
+    if args.list_imports:
+        importer.list_import_history()
+        sys.exit(0)
+
     # Run the import
     importer.run_import()
 

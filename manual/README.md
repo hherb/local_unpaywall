@@ -31,6 +31,27 @@ This directory contains detailed technical documentation for the Local Unpaywall
 - Test data creation and management
 - Performance testing guidelines
 
+#### [DOI URL Importer Resume System](doi_url_importer_resume.md)
+- Robust import system with resume capability
+- Progress tracking and error recovery
+- File hash verification and change detection
+
+### Database Management
+
+#### [Database Creation Module](database_creation_module.md)
+- Centralized database schema creation and management
+- Support for .env file and command-line configuration
+- Comprehensive table, index, and constraint creation
+- Integration with existing migration system
+- Standalone command-line tool for schema operations
+
+### Database Schema and Migrations
+
+#### [Schema Migration 001](schema_migration_001.md)
+- Integration of work_type and is_retracted fields
+- Migration from doi_metadata table to unified schema
+- Backward compatibility and testing procedures
+
 ## System Architecture
 
 ### Component Overview
@@ -52,9 +73,18 @@ The Local Unpaywall system consists of several interconnected components:
                                                                    │
                                                                    ▼
 ┌─────────────────────┐    ┌──────────────────────┐    ┌─────────────────────┐
-│   Downloaded PDFs   │◀───│    PDF Fetcher       │◀───│   PostgreSQL        │
-│                     │    │  (pdf_fetcher.py)    │    │   Database          │
+│   Downloaded PDFs   │    │    PDF Fetcher       │    │   PostgreSQL        │
+│                     │◀───│  (pdf_fetcher.py)    │◀───│   Database          │
 └─────────────────────┘    └──────────────────────┘    └─────────────────────┘
+                                                                   ▲
+                                                                   │
+                                                       ┌─────────────────────┐
+                                                       │  Database Creator   │
+                                                       │  (db/create_db.py)  │
+                                                       │  - Schema creation  │
+                                                       │  - Index management │
+                                                       │  - Permissions      │
+                                                       └─────────────────────┘
 ```
 
 ### Data Flow
@@ -179,6 +209,11 @@ with sqlite3.connect(db_path) as conn:
 - **Purpose**: PDF download utility with progress tracking
 - **Key Methods**: `download_pdf()`, `validate_pdf_content()`, `get_file_size()`
 - **Documentation**: [pdf_fetcher.md](pdf_fetcher.md)
+
+#### `DatabaseCreator`
+- **Purpose**: Centralized database schema creation and management
+- **Key Methods**: `create_complete_schema()`, `verify_schema()`, `get_schema_info()`
+- **Documentation**: [database_creation_module.md](database_creation_module.md)
 
 ### Utility Functions
 

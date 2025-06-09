@@ -186,7 +186,7 @@ CREATE TABLE doi_urls (
     doi TEXT NOT NULL,                    -- DOI identifier only
     url TEXT NOT NULL,                    -- Full text URL
     pdf_url TEXT,                         -- Direct PDF URL
-    openalex_id TEXT,                     -- OpenAlex work ID
+    openalex_id BIGINT,                   -- OpenAlex work ID (numeric part only)
     title TEXT,                           -- Publication title
     publication_year INTEGER,             -- Publication year
     location_type TEXT NOT NULL,          -- Source type
@@ -195,6 +195,8 @@ CREATE TABLE doi_urls (
     host_type TEXT,                       -- Host type
     oa_status TEXT,                       -- OA status
     is_oa BOOLEAN DEFAULT FALSE,          -- OA flag
+    work_type TEXT,                       -- Work type (journal-article, book-chapter, etc.)
+    is_retracted BOOLEAN DEFAULT FALSE,   -- Whether the work is retracted
     url_quality_score INTEGER DEFAULT 50, -- Quality score
     last_verified TIMESTAMP,              -- Last verification
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -210,6 +212,8 @@ CREATE INDEX idx_doi_urls_doi ON doi_urls(doi);
 CREATE INDEX idx_doi_urls_url ON doi_urls(url);
 CREATE INDEX idx_doi_urls_pdf_url ON doi_urls(pdf_url) WHERE pdf_url IS NOT NULL;
 CREATE INDEX idx_doi_urls_oa_status ON doi_urls(oa_status) WHERE is_oa = TRUE;
+CREATE INDEX idx_doi_urls_work_type ON doi_urls(work_type);
+CREATE INDEX idx_doi_urls_is_retracted ON doi_urls(is_retracted);
 ```
 
 ## Complete Workflow
@@ -629,8 +633,13 @@ python openalex_unpaywall_extractor.py --resume
 # Check import progress
 SELECT COUNT(*) FROM doi_urls;
 
-# Resume import (automatically skips existing records)
-python doi_url_importer.py --csv-file urls.csv --resume
+# List recent import history
+python doi_url_importer.py --csv-file urls.csv --db-name biomedical \
+    --db-user myuser --db-password mypass --list-imports
+
+# Resume import from where it left off
+python doi_url_importer.py --csv-file urls.csv --db-name biomedical \
+    --db-user myuser --db-password mypass --resume
 ```
 
 ## Project Structure
