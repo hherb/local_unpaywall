@@ -1,0 +1,99 @@
+Thank you for providing the full source code for doi_url_importer.py. Based on a review of your importer, here’s a targeted analysis of why performance may degrade over time during a bulk import of 250 million records, even with indices deactivated:
+
+---
+
+## Key Points in Your Code
+
+1. **Batch Insert Logic**
+   - You insert records in batches (`batch_size`, default 10,000) but actually process them in much smaller chunks of 50 (`chunk_size`) during the database insert phase.
+   - Each chunk is inserted row-by-row inside a transaction, committing every 10 rows.
+
+2. **Deduplication and Upsert**
+   - Each batch is deduplicated in Python before insert.
+   - The insert uses ON CONFLICT (doi, url) DO UPDATE, which can be slower than a plain insert, especially with a growing table.
+
+3. **Foreign Key Lookups**
+   - For every row, foreign key IDs (license, oa_status, host_type, work_type) are fetched/created, each potentially opening a new DB connection unless the values are cached.
+
+4. **Index Management**
+   - You disable "non-essential" indexes but not primary/unique keys.
+
+5. **Resume/Progress Tracking**
+   - Progress is tracked/updated in the DB after each batch.
+
+---
+
+## Performance Bottleneck Analysis
+
+### A. Insert/Upsert Strategy
+
+- **Row-by-row insert (inside a chunk):**  
+  Even though you read in large batches, your database writes are done row-by-row (in a loop of 50 per chunk), committing every 10 rows. This is extremely slow for large imports, because:
+    - Each insert is a client-server round trip.
+    - Each commit/fsync is expensive.
+    - PostgreSQL's transaction log and buffer management are heavily exercised.
+
+- **ON CONFLICT Overhead:**  
+  The upsert logic means that for each row, PostgreSQL must check for an existing (doi, url) pair in a rapidly growing table. As the table grows, this check becomes more expensive, especially with large numbers of rows and no supporting index (besides the primary/unique key).
+
+### B. Foreign Key Lookup Overhead
+
+- **Frequent DB Connections:**  
+  `get_or_create_lookup_id` opens a new DB connection for every cache miss. For 250M rows and a non-trivial number of distinct values, this can lead to connection thrashing, locking, and context switching, which will become more severe as the import progresses.
+
+### C. VACUUM/Autovacuum Lag and Table Bloat
+
+- Even without indices, massive upserts/inserts cause table and TOAST bloat. If you update the same rows repeatedly (due to upsert), dead tuples accumulate and slow down future inserts/updates.
+
+### D. Write Amplification and WAL Pressure
+
+- Small, frequent commits (every 10 rows) greatly increase WAL and fsync overhead, especially compared to committing per-batch.
+
+---
+
+## Why Performance Drops Over Time
+
+- **Table Growth:** As the table fills, each ON CONFLICT check and upsert becomes slower.
+- **Row-by-Row Operations:** Insert throughput drops as the DB has to do more lookups and write more WAL per commit.
+- **Connection Churn:** Each cache miss creates a new DB connection for lookup tables, which becomes increasingly costly under load.
+- **Bloat:** Frequent upserts and small commits cause table bloat and increase the cost of future inserts.
+- **WAL Saturation:** Small commits and heavy upserts flood the WAL, leading to IO bottlenecks.
+
+---
+
+## How to Significantly Improve Performance
+
+1. **Bulk Insert with COPY**
+   - If possible, avoid ON CONFLICT during the initial load. Use COPY for bulk inserts, then deduplicate afterward if needed.
+
+2. **Increase Chunk Size and Reduce Commit Frequency**
+   - Commit only once per batch (e.g., per 10,000 rows), not every 10 rows.
+
+3. **Preload All Lookup Values**
+   - Preload all lookup tables into memory or load them completely before starting the main import, so no DB lookup/insert is needed during the main import.
+
+4. **Avoid Frequent DB Connections**
+   - Use a persistent connection for all lookups and inserts.
+
+5. **Consider Staging Table**
+   - Load everything into a staging table without constraints or indices, then move/deduplicate/merge into the final table in a post-processing step.
+
+6. **Tune PostgreSQL for Bulk Load**
+   - Increase `maintenance_work_mem`, `wal_buffers`, and `commit_delay`. Set `fsync=off` (if safe and you can afford to lose power during load), and make sure autovacuum is tuned for the load.
+
+---
+
+## Summary Table
+
+| Bottleneck                     | Why it hurts over time                       | Solution                                 |
+|------------------------------- |--------------------------------------------- |------------------------------------------|
+| Row-by-row insert/upsert       | More rows = slower unique checks/upserts     | Use COPY, batch upserts, bigger commits  |
+| Frequent commits               | High WAL & fsync overhead                    | Commit once per big batch                |
+| Frequent DB connections        | Connection overhead, locking                 | Use persistent connections, preload      |
+| Foreign key cache misses       | More cache misses = more slow lookups        | Preload all lookup values                |
+| ON CONFLICT on large table     | Unique checks get slower as table grows      | Use staging, deduplicate after bulk load |
+| Table bloat                    | Slower inserts as table fills                | Periodic VACUUM, or staging table        |
+
+---
+
+If you want specific code recommendations or a refactor for any of these points, let me know!
