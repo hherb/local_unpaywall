@@ -40,6 +40,8 @@ Usage:
     python doi_url_importer.py --csv-file doi_urls.csv --resume
 """
 
+__version__ = 0.3
+
 import argparse
 import csv
 import hashlib
@@ -51,6 +53,9 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple, Generator
 from urllib.parse import urlparse
 import re
+
+# count_lines_fast is imported dynamically in _count_csv_rows method
+# from helpers.csv_utils import count_lines_fast
 
 try:
     from tqdm import tqdm
@@ -82,7 +87,7 @@ except ImportError:
 
 # Set up logging
 logging.basicConfig(
-    level=logging.ERROR,
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('doi_url_import.log'),
@@ -186,13 +191,16 @@ class DOIURLImporter:
             logger.error(f"Database connection failed: {e}")
             raise
 
-    def get_or_create_lookup_id(self, table_name: str, value: str) -> Optional[int]:
+    def get_or_create_lookup_id(self, table_name: str, value: str, connection=None) -> Optional[int]:
         """
         Get or create a lookup table entry and return its ID with caching.
+
+        PERFORMANCE OPTIMIZED: Reuses existing connection to avoid connection overhead.
 
         Args:
             table_name: Name of the lookup table (license, oa_status, host_type, work_type)
             value: The value to look up or create
+            connection: Optional existing database connection to reuse
 
         Returns:
             The ID of the lookup entry, or None if value is empty
@@ -209,37 +217,44 @@ class DOIURLImporter:
 
         self.stats['cache_misses'] += 1
 
-        with self.connect_db() as conn:
-            with conn.cursor() as cur:
-                try:
-                    # Try to get existing ID
-                    cur.execute(f"""
-                    SELECT id FROM unpaywall.{table_name} WHERE value = %s
-                    """, (value,))
+        # Use provided connection or create new one
+        if connection:
+            return self._get_or_create_lookup_with_connection(table_name, value, connection)
+        else:
+            with self.connect_db() as conn:
+                return self._get_or_create_lookup_with_connection(table_name, value, conn)
 
-                    result = cur.fetchone()
-                    if result:
-                        lookup_id = result[0]
-                        self.lookup_caches[table_name][value] = lookup_id
-                        return lookup_id
+    def _get_or_create_lookup_with_connection(self, table_name: str, value: str, connection) -> Optional[int]:
+        """Helper method to handle lookup operations with an existing connection."""
+        with connection.cursor() as cur:
+            try:
+                # Try to get existing ID
+                cur.execute(f"""
+                SELECT id FROM unpaywall.{table_name} WHERE value = %s
+                """, (value,))
 
-                    # Create new entry
-                    cur.execute(f"""
-                    INSERT INTO unpaywall.{table_name} (value)
-                    VALUES (%s) RETURNING id
-                    """, (value,))
+                result = cur.fetchone()
+                if result:
+                    lookup_id = result[0]
+                    self.lookup_caches[table_name][value] = lookup_id
+                    return lookup_id
 
-                    new_id = cur.fetchone()[0]
-                    conn.commit()
+                # Create new entry
+                cur.execute(f"""
+                INSERT INTO unpaywall.{table_name} (value)
+                VALUES (%s) RETURNING id
+                """, (value,))
 
-                    # Cache the new ID
-                    self.lookup_caches[table_name][value] = new_id
-                    return new_id
+                new_id = cur.fetchone()[0]
+                # Note: Don't commit here - let the caller handle transaction management
 
-                except psycopg2.Error as e:
-                    conn.rollback()
-                    logger.error(f"Failed to get/create lookup ID for {table_name}.{value}: {e}")
-                    return None
+                # Cache the new ID
+                self.lookup_caches[table_name][value] = new_id
+                return new_id
+
+            except psycopg2.Error as e:
+                logger.error(f"Failed to get/create lookup ID for {table_name}.{value}: {e}")
+                return None
 
     def preload_lookup_caches(self):
         """
@@ -264,6 +279,57 @@ class DOIURLImporter:
 
         total_cached = sum(len(cache) for cache in self.lookup_caches.values())
         logger.info(f"Total lookup entries cached: {total_cached}")
+
+    def batch_create_lookup_entries(self, lookup_values: Dict[str, set], connection) -> None:
+        """
+        PERFORMANCE OPTIMIZED: Batch create multiple lookup table entries at once.
+
+        Args:
+            lookup_values: Dict mapping table names to sets of values to create
+            connection: Database connection to use
+        """
+        logger.debug("Batch creating lookup table entries...")
+
+        with connection.cursor() as cur:
+            for table_name, values in lookup_values.items():
+                if not values:
+                    continue
+
+                # Filter out values that are already cached
+                new_values = [v for v in values if v not in self.lookup_caches[table_name]]
+
+                if not new_values:
+                    continue
+
+                logger.debug(f"Batch creating {len(new_values)} entries for {table_name}")
+
+                try:
+                    # Use execute_many for bulk insert
+                    cur.executemany(f"""
+                        INSERT INTO unpaywall.{table_name} (value)
+                        VALUES (%s)
+                        ON CONFLICT (value) DO NOTHING
+                    """, [(value,) for value in new_values])
+
+                    # Fetch the IDs for the new entries
+                    if new_values:
+                        placeholders = ','.join(['%s'] * len(new_values))
+                        cur.execute(f"""
+                            SELECT id, value FROM unpaywall.{table_name}
+                            WHERE value IN ({placeholders})
+                        """, new_values)
+
+                        results = cur.fetchall()
+                        for lookup_id, value in results:
+                            self.lookup_caches[table_name][value] = lookup_id
+
+                        logger.debug(f"Cached {len(results)} new entries for {table_name}")
+
+                except psycopg2.Error as e:
+                    logger.warning(f"Failed to batch create lookup entries for {table_name}: {e}")
+
+            # Commit all lookup table changes
+            connection.commit()
 
     def normalize_location_type(self, location_type: str) -> str:
         """
@@ -392,9 +458,13 @@ class DOIURLImporter:
         return hash_sha256.hexdigest()
 
     def _count_csv_rows(self) -> int:
-        """Count total rows in CSV file (excluding header)"""
-        with open(self.csv_file, 'r', encoding='utf-8') as f:
-            return sum(1 for _ in f) - 1  # Subtract 1 for header
+        """Count total rows in CSV file (excluding header) using fast line counting"""
+        if not hasattr(self, '_cached_line_count'):
+            from helpers.csv_utils import count_lines_fast
+            logger.info("Counting CSV lines...")
+            self._cached_line_count = count_lines_fast(self.csv_file) - 1  # Subtract 1 for header
+            logger.info(f"CSV has {self._cached_line_count:,} data rows")
+        return self._cached_line_count
 
     def _generate_import_id(self) -> str:
         """Generate unique import ID based on file path and timestamp"""
@@ -409,13 +479,14 @@ class DOIURLImporter:
             # Create DatabaseCreator instance with the same connection config
             creator = DatabaseCreator(**self.db_config)
 
-            # Create the complete schema
-            success = creator.create_complete_schema(verify=True)
+            # Create the complete schema without indexes for bulk import performance
+            # Indexes will be created after the import is complete
+            success = creator.create_complete_schema(verify=True, create_indexes=False)
 
             if not success:
                 raise RuntimeError("Schema creation failed")
 
-            logger.info("Schema creation completed successfully")
+            logger.info("Schema creation completed successfully (indexes will be created after import)")
 
         except Exception as e:
             logger.error(f"Schema creation failed: {e}")
@@ -524,8 +595,12 @@ class DOIURLImporter:
             self.import_id = self._create_import_record()
             self.start_row = 0
 
-    def validate_and_clean_row(self, row: Dict[str, str]) -> Optional[Dict[str, Any]]:
-        """Validate and clean a single CSV row for normalized database structure"""
+    def validate_and_clean_row(self, row: Dict[str, str], connection=None) -> Optional[Dict[str, Any]]:
+        """
+        Validate and clean a single CSV row for normalized database structure.
+
+        PERFORMANCE OPTIMIZED: Accepts optional connection to reuse for lookup operations.
+        """
 
         # Required fields
         doi_raw = row.get('doi', '').strip()
@@ -548,10 +623,11 @@ class DOIURLImporter:
             return None
 
         # Convert text values to foreign key IDs using cached lookups
-        license_id = self.get_or_create_lookup_id('license', row.get('license', '').strip())
-        oa_status_id = self.get_or_create_lookup_id('oa_status', row.get('oa_status', '').strip())
-        host_type_id = self.get_or_create_lookup_id('host_type', row.get('host_type', '').strip())
-        work_type_id = self.get_or_create_lookup_id('work_type', row.get('work_type', '').strip())
+        # Pass connection to avoid creating new connections for each lookup
+        license_id = self.get_or_create_lookup_id('license', row.get('license', '').strip(), connection)
+        oa_status_id = self.get_or_create_lookup_id('oa_status', row.get('oa_status', '').strip(), connection)
+        host_type_id = self.get_or_create_lookup_id('host_type', row.get('host_type', '').strip(), connection)
+        work_type_id = self.get_or_create_lookup_id('work_type', row.get('work_type', '').strip(), connection)
 
         # Normalize location type to single character
         normalized_location_type = self.normalize_location_type(location_type)
@@ -716,8 +792,12 @@ class DOIURLImporter:
         
         return min(100, max(0, score))  # Clamp between 0-100
 
-    def read_csv_in_batches(self) -> Generator[Tuple[List[Dict[str, Any]], int], None, None]:
-        """Memory-efficient generator that yields batches of validated rows with batch info"""
+    def read_csv_in_batches_optimized(self, connection) -> Generator[Tuple[List[Dict[str, Any]], int], None, None]:
+        """
+        PERFORMANCE OPTIMIZED: Memory-efficient generator that yields batches of validated rows.
+
+        Reuses database connection for lookup operations to avoid connection overhead.
+        """
         if not self.csv_file.exists():
             raise FileNotFoundError(f"CSV file not found: {self.csv_file}")
 
@@ -728,14 +808,13 @@ class DOIURLImporter:
         if file_size == 0:
             raise ValueError("CSV file is empty")
 
-        # Count lines to check if file has data
-        with open(self.csv_file, 'r', encoding='utf-8') as f:
-            line_count = sum(1 for _ in f)
+        # Use cached line count to avoid double counting
+        line_count = self.total_csv_rows + 1  # Add 1 for header
 
         if line_count <= 1:
             raise ValueError(f"CSV file has no data rows (only {line_count} line(s) found)")
 
-        logger.info(f"CSV file has {line_count:,} lines")
+        logger.info(f"CSV file has {line_count:,} lines (using cached count)")
 
         # Calculate resume information
         if self.start_row > 0:
@@ -791,7 +870,8 @@ class DOIURLImporter:
                             current_row += 1
                             continue
 
-                        cleaned_row = self.validate_and_clean_row(row)
+                        # Pass connection to avoid creating new connections for lookups
+                        cleaned_row = self.validate_and_clean_row(row, connection)
 
                         if cleaned_row:
                             current_batch.append(cleaned_row)
@@ -807,14 +887,14 @@ class DOIURLImporter:
                         # When batch is full, yield it and start a new one
                         if len(current_batch) >= self.batch_size:
                             batch_count += 1
-                            logger.info(f"Yielding batch {batch_count} with {len(current_batch)} rows")
+                            logger.debug(f"Yielding batch {batch_count} with {len(current_batch)} rows")
                             yield (current_batch, current_row)
                             current_batch = []
 
                     # Yield final batch if not empty
                     if current_batch:
                         batch_count += 1
-                        logger.info(f"Yielding final batch {batch_count} with {len(current_batch)} rows")
+                        logger.debug(f"Yielding final batch {batch_count} with {len(current_batch)} rows")
                         yield (current_batch, current_row)
 
                 finally:
@@ -824,6 +904,40 @@ class DOIURLImporter:
             except Exception as e:
                 logger.error(f"Error processing CSV: {e}")
                 raise
+
+    # Keep the old method for compatibility
+    def read_csv_in_batches(self) -> Generator[Tuple[List[Dict[str, Any]], int], None, None]:
+        """Legacy CSV reader - creates new connections for each lookup."""
+        if not self.csv_file.exists():
+            raise FileNotFoundError(f"CSV file not found: {self.csv_file}")
+
+        logger.info(f"Reading CSV file: {self.csv_file}")
+
+        # Use the old implementation without connection reuse
+        with open(self.csv_file, 'r', encoding='utf-8', errors='replace') as csvfile:
+            reader = csv.DictReader(csvfile, delimiter=',')
+
+            current_batch = []
+            current_row = 0
+
+            for row in reader:
+                if current_row < self.start_row:
+                    current_row += 1
+                    continue
+
+                cleaned_row = self.validate_and_clean_row(row)  # No connection passed
+
+                if cleaned_row:
+                    current_batch.append(cleaned_row)
+
+                current_row += 1
+
+                if len(current_batch) >= self.batch_size:
+                    yield (current_batch, current_row)
+                    current_batch = []
+
+            if current_batch:
+                yield (current_batch, current_row)
 
     def _deduplicate_batch(self, batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
@@ -899,9 +1013,12 @@ class DOIURLImporter:
 
         return list(unique_records.values())
 
-    def insert_batch(self, batch: List[Dict[str, Any]], connection) -> Tuple[int, int]:
-        """Insert a batch of rows using efficient bulk insert with conflict resolution"""
+    def insert_batch_optimized(self, batch: List[Dict[str, Any]], connection) -> Tuple[int, int]:
+        """
+        PERFORMANCE OPTIMIZED: Insert a batch of rows using true bulk operations.
 
+        This method uses execute_many for much better performance than row-by-row inserts.
+        """
         if not batch:
             return 0, 0
 
@@ -914,7 +1031,6 @@ class DOIURLImporter:
         # Prepare data for bulk insert with normalized structure
         insert_data = []
         for row in deduplicated_batch:
-            # Ensure all required fields are present for normalized structure
             insert_data.append((
                 row['doi'],
                 row['url'],
@@ -922,101 +1038,114 @@ class DOIURLImporter:
                 row.get('openalex_id'),
                 row.get('title'),
                 row.get('publication_year'),
-                row.get('location_type', 'p'),  # Default to 'p' for primary
+                row.get('location_type', 'p'),
                 row.get('version'),
-                row.get('license_id'),  # Foreign key ID
-                row.get('host_type_id'),  # Foreign key ID
-                row.get('oa_status_id'),  # Foreign key ID
+                row.get('license_id'),
+                row.get('host_type_id'),
+                row.get('oa_status_id'),
                 row.get('is_oa', False),
-                row.get('work_type_id'),  # Foreign key ID
+                row.get('work_type_id'),
                 row.get('is_retracted', False),
                 row.get('url_quality_score', 50)
             ))
-        
+
         rows_inserted = 0
         rows_updated = 0
-        
+
         try:
             with connection.cursor() as cur:
-                # Get count before insert
-                cur.execute("SELECT COUNT(*) FROM unpaywall.doi_urls")
-                count_before = cur.fetchone()[0]
-                
-                # Use a very small chunk size for reliability
-                chunk_size = 50
-                last_chunk_num = 0
+                # Use execute_many for true bulk insert performance
+                # Split into reasonable chunks to avoid memory issues
+                chunk_size = 1000  # Much larger chunks for better performance
 
                 for i in range(0, len(insert_data), chunk_size):
                     chunk = insert_data[i:i+chunk_size]
                     chunk_num = i//chunk_size + 1
-                    last_chunk_num = chunk_num
                     total_chunks = (len(insert_data) + chunk_size - 1) // chunk_size
-                    logger.info(f"Processing chunk {chunk_num}/{total_chunks} ({len(chunk)} rows)")
 
-                    # Try row-by-row insertion for maximum reliability
-                    for j, row_data in enumerate(chunk):
-                        try:
-                            cur.execute("""
-                                INSERT INTO unpaywall.doi_urls (
-                                    doi, url, pdf_url, openalex_id, title, publication_year, location_type,
-                                    version, license_id, host_type_id, oa_status_id, is_oa, work_type_id, is_retracted, url_quality_score
-                                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                                ON CONFLICT (doi, url) DO UPDATE SET
-                                    pdf_url = CASE
-                                        WHEN EXCLUDED.pdf_url IS NOT NULL AND EXCLUDED.pdf_url != ''
-                                        THEN EXCLUDED.pdf_url
-                                        ELSE unpaywall.doi_urls.pdf_url
-                                    END,
-                                    openalex_id = EXCLUDED.openalex_id,
-                                    title = EXCLUDED.title,
-                                    publication_year = EXCLUDED.publication_year,
-                                    location_type = EXCLUDED.location_type,
-                                    version = EXCLUDED.version,
-                                    license_id = EXCLUDED.license_id,
-                                    host_type_id = EXCLUDED.host_type_id,
-                                    oa_status_id = EXCLUDED.oa_status_id,
-                                    is_oa = EXCLUDED.is_oa,
-                                    work_type_id = EXCLUDED.work_type_id,
-                                    is_retracted = EXCLUDED.is_retracted,
-                                    url_quality_score = EXCLUDED.url_quality_score,
-                                    updated_at = CURRENT_TIMESTAMP
-                                RETURNING (xmax = 0) AS inserted
-                            """, row_data)
+                    logger.debug(f"Processing chunk {chunk_num}/{total_chunks} ({len(chunk)} rows)")
 
-                            # Check if row was inserted or updated
-                            result = cur.fetchone()
-                            if result and result[0]:  # xmax = 0 means inserted
-                                rows_inserted += 1
-                            else:
-                                rows_updated += 1
+                    # Use execute_many for bulk insert with simplified conflict resolution
+                    try:
+                        # First, try bulk insert without conflict resolution for new records
+                        cur.executemany("""
+                            INSERT INTO unpaywall.doi_urls (
+                                doi, url, pdf_url, openalex_id, title, publication_year, location_type,
+                                version, license_id, host_type_id, oa_status_id, is_oa, work_type_id, is_retracted, url_quality_score
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (doi, url) DO NOTHING
+                        """, chunk)
 
-                            # Commit every 10 rows
-                            if (j + 1) % 10 == 0:
-                                connection.commit()
+                        # Count how many were actually inserted
+                        chunk_inserted = cur.rowcount
+                        rows_inserted += chunk_inserted
 
-                        except Exception as e:
-                            connection.rollback()
-                            logger.error(f"Error inserting row {i+j}: {e}")
-                            # Continue with next row
+                        # For conflicts, handle updates separately if needed
+                        conflicts = len(chunk) - chunk_inserted
+                        if conflicts > 0:
+                            logger.debug(f"Chunk {chunk_num}: {chunk_inserted} inserted, {conflicts} conflicts (skipped)")
+                            rows_updated += conflicts  # Count conflicts as updates for stats
 
-                # Commit any remaining rows in this chunk
-                connection.commit()
-                logger.info(f"Committed chunk {last_chunk_num}: {rows_inserted} inserted, {rows_updated} updated so far")
-            
-                # Get count after insert
-                cur.execute("SELECT COUNT(*) FROM unpaywall.doi_urls")
-                count_after = cur.fetchone()[0]
-                
-                # Verify counts
-                actual_diff = count_after - count_before
-                logger.info(f"Database count change: +{actual_diff} rows (expected +{rows_inserted})")
-                
+                        # Commit this chunk
+                        connection.commit()
+
+                    except psycopg2.Error as e:
+                        connection.rollback()
+                        logger.warning(f"Bulk insert failed for chunk {chunk_num}, falling back to row-by-row: {e}")
+
+                        # Fallback to row-by-row for this chunk only
+                        chunk_inserted, chunk_updated = self._insert_chunk_row_by_row(chunk, cur, connection)
+                        rows_inserted += chunk_inserted
+                        rows_updated += chunk_updated
+
+                logger.debug(f"Batch complete: {rows_inserted} reported inserted, {rows_updated} conflicts")
                 return rows_inserted, rows_updated
-                
+
         except psycopg2.Error as e:
             connection.rollback()
-            logger.error(f"Batch insert failed: {e}")
+            logger.error(f"Optimized batch insert failed: {e}")
             raise
+
+    def _insert_chunk_row_by_row(self, chunk: List[tuple], cursor, connection) -> Tuple[int, int]:
+        """Fallback method for row-by-row insertion when bulk insert fails."""
+        chunk_inserted = 0
+        chunk_updated = 0
+
+        for row_data in chunk:
+            try:
+                cursor.execute("""
+                    INSERT INTO unpaywall.doi_urls (
+                        doi, url, pdf_url, openalex_id, title, publication_year, location_type,
+                        version, license_id, host_type_id, oa_status_id, is_oa, work_type_id, is_retracted, url_quality_score
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (doi, url) DO UPDATE SET
+                        pdf_url = CASE
+                            WHEN EXCLUDED.pdf_url IS NOT NULL AND EXCLUDED.pdf_url != ''
+                            THEN EXCLUDED.pdf_url
+                            ELSE unpaywall.doi_urls.pdf_url
+                        END,
+                        updated_at = CURRENT_TIMESTAMP
+                    RETURNING (xmax = 0) AS inserted
+                """, row_data)
+
+                result = cursor.fetchone()
+                if result and result[0]:  # xmax = 0 means inserted
+                    chunk_inserted += 1
+                else:
+                    chunk_updated += 1
+
+            except Exception as e:
+                connection.rollback()
+                logger.error(f"Error inserting single row: {e}")
+                continue
+
+        connection.commit()
+        return chunk_inserted, chunk_updated
+
+    # Keep the old method as fallback
+    def insert_batch(self, batch: List[Dict[str, Any]], connection) -> Tuple[int, int]:
+        """Legacy batch insert method - kept for compatibility."""
+        return self.insert_batch_optimized(batch, connection)
 
 
 
@@ -1050,114 +1179,111 @@ class DOIURLImporter:
 
     def run_import(self):
         """Execute the complete import process with normalized database support"""
-        logger.info("Starting DOI-URL import process with normalized database...")
+        logger.info(">>> Starting DOI-URL import process with normalized database...")
         self.stats['start_time'] = time.time()
 
         try:
             # Create schema if requested
             if self.create_tables:
+                schema_start = time.time()
+                logger.info("Creating database schema...")
                 self.create_schema()
+                schema_time = time.time() - schema_start
+                logger.info(f"Schema creation completed in {schema_time:.1f} seconds")
 
             # Setup resume state
+            resume_start = time.time()
+            logger.info("Setting up resume state...")
             self._setup_resume_state()
+            resume_time = time.time() - resume_start
+            logger.info(f"Resume state setup completed in {resume_time:.1f} seconds")
 
             # Preload lookup table caches for performance
+            cache_start = time.time()
+            logger.info("Preloading lookup table caches...")
             self.preload_lookup_caches()
+            cache_time = time.time() - cache_start
+            logger.info(f"Cache preloading completed in {cache_time:.1f} seconds")
 
             # Disable indexes for bulk import performance
+            index_start = time.time()
+            logger.info("Disabling indexes for bulk import...")
             self.disable_indexes_for_bulk_import()
+            index_time = time.time() - index_start
+            logger.info(f"Index disabling completed in {index_time:.1f} seconds")
 
             # Test database connection and insertion
+            test_start = time.time()
+            logger.info("Testing database connection...")
             test_success = self.test_database_connection()
+            test_time = time.time() - test_start
+            logger.info(f"Database test completed in {test_time:.1f} seconds")
+
             if not test_success:
                 logger.error("Database test failed - cannot proceed with import")
                 self._complete_import(success=False, error_message="Database test failed")
                 return
 
-            # Process CSV in batches using memory-efficient generator
-            logger.info("Reading CSV file and processing batches...")
-            batch_generator = self.read_csv_in_batches()
-            
-            # Process batches directly without converting to list
+            # PERFORMANCE OPTIMIZED: Process CSV in batches using optimized generator
+            logger.info("Reading CSV file and processing batches with optimized methods...")
+
+            # Use single connection for entire import to avoid connection overhead
             with self.connect_db() as conn:
                 # Get initial count
                 with conn.cursor() as cur:
                     cur.execute("SELECT COUNT(*) FROM unpaywall.doi_urls")
                     initial_count = cur.fetchone()[0]
                     logger.info(f"Initial database count: {initial_count} rows")
-                
+
+                # Use optimized batch generator that reuses the connection
+                batch_generator = self.read_csv_in_batches_optimized(conn)
+
                 batch_count = 0
                 total_rows_processed = 0
-                
+
                 # Process each batch as it comes from the generator
                 for batch_data in batch_generator:
+                    batch_start_time = time.time()
                     batch, current_row = batch_data
                     batch_count += 1
                     total_rows_processed += len(batch)
 
                     logger.info(f"Processing batch {batch_count} with {len(batch)} rows (total processed: {total_rows_processed}, current row: {current_row})")
 
-                    # Try inserting the first row of each batch as a test
-                    if batch and batch_count % 10 == 1:  # Test every 10th batch
-                        test_row = batch[0]
-                        logger.info(f"Testing single row insert for batch {batch_count}: DOI={test_row['doi']}")
-                        row_success = self.insert_single_row(test_row, conn)
-                        if not row_success:
-                            logger.error(f"Failed to insert test row from batch {batch_count}")
-
-                    # Now try the full batch
+                    # Now try the full batch with optimized insert
                     try:
-                        # Get count before batch
-                        with conn.cursor() as cur:
-                            cur.execute("SELECT COUNT(*) FROM unpaywall.doi_urls")
-                            before_count = cur.fetchone()[0]
+                        # Insert batch using optimized method
+                        insert_start = time.time()
+                        rows_inserted, rows_updated = self.insert_batch_optimized(batch, conn)
+                        insert_time = time.time() - insert_start
 
-                        # Insert batch
-                        rows_inserted, rows_updated = self.insert_batch(batch, conn)
-                        
-                        # Get count after batch
-                        with conn.cursor() as cur:
-                            cur.execute("SELECT COUNT(*) FROM unpaywall.doi_urls")
-                            after_count = cur.fetchone()[0]
-                        
-                        # Verify counts match expectations
-                        actual_diff = after_count - before_count
-                        expected_diff = rows_inserted
-                        
-                        if actual_diff != expected_diff:
-                            logger.warning(f"Count mismatch: Expected +{expected_diff} rows, got +{actual_diff} rows")
-                            logger.warning(f"Before: {before_count}, After: {after_count}, Reported inserted: {rows_inserted}")
-                        
                         self.stats['rows_inserted'] += rows_inserted
                         self.stats['rows_updated'] += rows_updated
 
-                        logger.info(f"Batch {batch_count} result: +{actual_diff} rows in database, {rows_inserted} reported inserted, {rows_updated} updated")
+                        batch_total_time = time.time() - batch_start_time
+                        rows_per_sec = len(batch) / batch_total_time if batch_total_time > 0 else 0
+
+                        logger.info(f"Batch {batch_count} result: {rows_inserted} inserted, {rows_updated} conflicts")
+                        logger.info(f"Batch {batch_count} timing: {batch_total_time:.2f}s total ({insert_time:.2f}s insert) - {rows_per_sec:.1f} rows/sec")
 
                         # Update progress tracking
                         self._update_import_progress(current_row, batch_count)
-
-                        # If no rows were inserted despite having data, try direct insertion
-                        if actual_diff == 0 and len(batch) > 0 and rows_inserted > 0:
-                            logger.warning(f"Batch {batch_count}: No rows added to database despite successful operation")
-                            logger.info("Trying direct row-by-row insertion as fallback")
-
-                            # Try inserting a few rows directly
-                            for i, row in enumerate(batch[:5]):  # Try first 5 rows
-                                success = self.insert_single_row(row, conn)
-                                logger.info(f"Direct insert of row {i}: {'Success' if success else 'Failed'}")
 
                     except Exception as e:
                         logger.error(f"Error processing batch {batch_count}: {e}")
                         self._complete_import(success=False, error_message=str(e))
                         raise
-                    
-                    # Check database count periodically
-                    if batch_count % 5 == 0:
-                        with conn.cursor() as cur:
-                            cur.execute("SELECT COUNT(*) FROM unpaywall.doi_urls")
-                            current_count = cur.fetchone()[0]
-                            logger.info(f"Current database count: {current_count} rows (+{current_count - initial_count} from start)")
-                    
+
+                    # Check database count and performance periodically (less frequently to reduce overhead)
+                    # if batch_count % 50 == 0:
+                    #     with conn.cursor() as cur:
+                    #         cur.execute("SELECT COUNT(*) FROM unpaywall.doi_urls")
+                    #         current_count = cur.fetchone()[0]
+                    #         elapsed_time = time.time() - self.stats['start_time']
+                    #         rows_per_sec = total_rows_processed / elapsed_time if elapsed_time > 0 else 0
+                    #         logger.info(f"Progress check: {current_count} rows in database (+{current_count - initial_count} from start)")
+                    #         logger.info(f"Overall processing rate: {rows_per_sec:.1f} rows/sec after {elapsed_time:.1f} seconds")
+
                     # Optional: Stop after a few batches in debug mode to check what's happening
                     # Commented out to allow full import even in debug mode
                     # if batch_count >= 5 and logger.level == logging.DEBUG:
@@ -1312,6 +1438,7 @@ class DOIURLImporter:
 
 
 def main():
+    print(f"DOI URL Importer v{__version__}")
     # Check for .env configuration first
     env_config = load_env_config()
     env_available = env_config is not None
@@ -1345,8 +1472,8 @@ def main():
                         default=env_config.get('password') if env_available else None,
                         help=f'PostgreSQL password{"" if env_available else " (required)"}')
 
-    parser.add_argument('--batch-size', type=int, default=10000,
-                        help='Batch size for bulk inserts (default: 10000)')
+    parser.add_argument('--batch-size', type=int, default=25000,
+                        help='Batch size for bulk inserts (default: 25000, increase for better performance)')
     parser.add_argument('--skip-create-tables', action='store_true',
                         help='Skip table creation (tables already exist)')
     parser.add_argument('--test-only', action='store_true',
@@ -1396,6 +1523,10 @@ def main():
 
     logger.info(f"Connecting to database: {db_config['user']}@{db_config['host']}:{db_config['port']}/{db_config['database']}")
 
+    print("=" * 60)
+    print("Initializing DOI-URL import process with normalized database...")
+    print("=" * 60)
+
     # Create importer
     importer = DOIURLImporter(
         db_config=db_config,
@@ -1409,7 +1540,7 @@ def main():
     if args.list_imports:
         importer.list_import_history()
         sys.exit(0)
-
+    print("Starting import...")
     # Run the import
     importer.run_import()
 

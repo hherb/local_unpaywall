@@ -195,11 +195,43 @@ class TestDatabaseCreator(unittest.TestCase):
     def test_create_complete_schema_connection_failure(self, mock_test):
         """Test complete schema creation with connection failure."""
         mock_test.return_value = False
-        
+
         result = self.creator.create_complete_schema()
-        
+
         self.assertFalse(result)
         mock_test.assert_called_once()
+
+    @patch.object(DatabaseCreator, 'test_connection')
+    @patch.object(DatabaseCreator, 'create_unpaywall_schema')
+    @patch.object(DatabaseCreator, 'create_lookup_tables')
+    @patch.object(DatabaseCreator, 'create_doi_urls_table')
+    @patch.object(DatabaseCreator, 'create_import_progress_table')
+    @patch.object(DatabaseCreator, 'create_doi_urls_indexes')
+    @patch.object(DatabaseCreator, 'create_import_progress_indexes')
+    @patch.object(DatabaseCreator, 'set_permissions')
+    @patch.object(DatabaseCreator, 'verify_schema')
+    def test_create_complete_schema_without_indexes(self, mock_verify, mock_permissions,
+                                                  mock_import_indexes, mock_doi_indexes,
+                                                  mock_import_table, mock_doi_table,
+                                                  mock_lookup_tables, mock_schema, mock_test):
+        """Test complete schema creation without indexes for bulk import."""
+        # Mock all methods to succeed
+        mock_test.return_value = True
+        mock_verify.return_value = True
+
+        result = self.creator.create_complete_schema(create_indexes=False)
+
+        self.assertTrue(result)
+        mock_test.assert_called_once()
+        mock_schema.assert_called_once()
+        mock_lookup_tables.assert_called_once()
+        mock_doi_table.assert_called_once()
+        mock_import_table.assert_called_once()
+        # Index creation methods should NOT be called
+        mock_doi_indexes.assert_not_called()
+        mock_import_indexes.assert_not_called()
+        mock_permissions.assert_called_once()
+        mock_verify.assert_called_once()
 
 
 if __name__ == '__main__':

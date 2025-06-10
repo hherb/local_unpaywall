@@ -27,7 +27,7 @@ Usage:
 import csv
 import logging
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Generator, Callable
+from typing import Dict, List, Any, Optional, Generator, Callable, Union
 
 try:
     from tqdm import tqdm
@@ -47,6 +47,73 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def count_lines_fast(file_path: Union[str, Path], show_progress: bool = True) -> int:
+    """
+    Fast line counting using large buffer reads with optional progress indicator.
+
+    This function is much faster than the old line-by-line approach,
+    especially for large files. It reads the file in 1MB chunks
+    and counts newline characters, showing progress for large files.
+
+    Args:
+        file_path: Path to the file to count lines in
+        show_progress: Whether to show progress bar for large files (>10MB)
+
+    Returns:
+        Number of lines in the file
+
+    Example:
+        # Count lines in a CSV file
+        line_count = count_lines_fast('large_file.csv')
+
+        # Count lines without progress bar
+        line_count = count_lines_fast('file.csv', show_progress=False)
+    """
+    file_path = Path(file_path)
+
+    if not file_path.exists():
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    file_size = file_path.stat().st_size
+    if file_size == 0:
+        return 0
+
+    line_count = 0
+    buffer_size = 1024 * 1024  # 1MB buffer for optimal performance
+
+    # Show progress bar for files larger than 10MB
+    show_count_progress = show_progress and file_size > 10 * 1024 * 1024
+    progress_bar = None
+
+    if show_count_progress:
+        progress_bar = tqdm(
+            total=file_size,
+            desc="Counting lines",
+            unit="B",
+            unit_scale=True,
+            unit_divisor=1024
+        )
+
+    try:
+        with open(file_path, 'rb') as f:
+            while True:
+                buffer = f.read(buffer_size)
+                if not buffer:
+                    break
+
+                line_count += buffer.count(b'\n')
+
+                if progress_bar:
+                    progress_bar.update(len(buffer))
+
+    finally:
+        if progress_bar:
+            progress_bar.close()
+
+    logger.debug(f"Fast line count: {line_count:,} lines ({file_size / 1024 / 1024:.1f} MB)")
+    return line_count
+
+
 class CSVBatchProcessor:
     """
     Memory-efficient CSV processor that yields batches of rows using generators.
@@ -58,27 +125,31 @@ class CSVBatchProcessor:
     4. Progress tracking
     """
     
-    def __init__(self, 
-                 csv_file: str, 
+    def __init__(self,
+                 csv_file: str,
                  batch_size: int = 10000,
                  validator: Optional[Callable[[Dict[str, str]], Optional[Dict[str, Any]]]] = None,
                  show_progress: bool = True,
-                 encoding: str = 'utf-8'):
+                 encoding: str = 'utf-8',
+                 enable_line_count: bool = True):
         """
         Initialize the CSV batch processor.
-        
+
         Args:
             csv_file: Path to the CSV file
             batch_size: Number of rows per batch
             validator: Optional function to validate/transform each row
             show_progress: Whether to show progress bar
             encoding: File encoding
+            enable_line_count: Whether to count lines for progress tracking (default: True)
+                              Set to False for maximum performance on very large files
         """
         self.csv_file = Path(csv_file)
         self.batch_size = batch_size
         self.validator = validator
         self.show_progress = show_progress
         self.encoding = encoding
+        self.enable_line_count = enable_line_count
         
         # Statistics
         self.stats = {
@@ -110,9 +181,13 @@ class CSVBatchProcessor:
                 return ','
     
     def _count_lines(self) -> int:
-        """Count total lines in the CSV file."""
-        with open(self.csv_file, 'r', encoding=self.encoding) as f:
-            return sum(1 for _ in f)
+        """
+        Fast line counting using the standalone count_lines_fast function.
+
+        Returns:
+            Number of lines in the file
+        """
+        return count_lines_fast(self.csv_file, show_progress=True)
     
     def process_batches(self) -> Generator[List[Dict[str, Any]], None, None]:
         """
@@ -129,12 +204,17 @@ class CSVBatchProcessor:
         if file_size == 0:
             raise ValueError("CSV file is empty")
         
-        # Count lines for progress tracking
-        line_count = self._count_lines()
-        if line_count <= 1:
-            raise ValueError(f"CSV file has no data rows (only {line_count} line(s) found)")
-        
-        logger.info(f"Processing CSV file: {self.csv_file} ({line_count:,} lines)")
+        # Count lines for progress tracking (optional for performance)
+        line_count = None
+        if self.show_progress and self.enable_line_count:
+            line_count = self._count_lines()
+            if line_count <= 1:
+                raise ValueError(f"CSV file has no data rows (only {line_count} line(s) found)")
+            logger.info(f"Processing CSV file: {self.csv_file} ({line_count:,} lines)")
+        elif self.show_progress:
+            logger.info(f"Processing CSV file: {self.csv_file} (line counting disabled for performance)")
+        else:
+            logger.info(f"Processing CSV file: {self.csv_file}")
         
         with open(self.csv_file, 'r', encoding=self.encoding) as csvfile:
             # Detect delimiter
@@ -156,12 +236,20 @@ class CSVBatchProcessor:
             # Initialize progress bar
             progress_bar = None
             if self.show_progress:
-                progress_bar = tqdm(
-                    total=line_count - 1,  # Subtract 1 for header
-                    desc="Processing CSV",
-                    unit="rows",
-                    unit_scale=True
-                )
+                if line_count is not None:
+                    progress_bar = tqdm(
+                        total=line_count - 1,  # Subtract 1 for header
+                        desc="Processing CSV",
+                        unit="rows",
+                        unit_scale=True
+                    )
+                else:
+                    # Progress bar without total (shows count and rate only)
+                    progress_bar = tqdm(
+                        desc="Processing CSV",
+                        unit="rows",
+                        unit_scale=True
+                    )
             
             current_batch = []
             
@@ -181,7 +269,7 @@ class CSVBatchProcessor:
                     
                     self.stats['total_rows_processed'] += 1
                     
-                    if progress_bar:
+                    if progress_bar is not None:
                         progress_bar.update(1)
                     
                     # Yield batch when full
@@ -196,7 +284,7 @@ class CSVBatchProcessor:
                     yield current_batch
                     
             finally:
-                if progress_bar:
+                if progress_bar is not None:
                     progress_bar.close()
         
         logger.info(f"CSV processing complete. {self.stats['batches_yielded']} batches yielded, "
@@ -207,28 +295,31 @@ class CSVBatchProcessor:
         return self.stats.copy()
 
 
-def process_csv_in_batches(csv_file: str, 
+def process_csv_in_batches(csv_file: str,
                           batch_size: int = 10000,
                           validator: Optional[Callable[[Dict[str, str]], Optional[Dict[str, Any]]]] = None,
-                          show_progress: bool = True) -> Generator[List[Dict[str, Any]], None, None]:
+                          show_progress: bool = True,
+                          enable_line_count: bool = True) -> Generator[List[Dict[str, Any]], None, None]:
     """
     Convenience function for memory-efficient CSV batch processing.
-    
+
     Args:
         csv_file: Path to CSV file
         batch_size: Number of rows per batch
         validator: Optional row validation/transformation function
         show_progress: Whether to show progress bar
-        
+        enable_line_count: Whether to count lines for progress tracking (default: True)
+                          Set to False for maximum performance on very large files
+
     Yields:
         Batches of CSV rows as lists of dictionaries
-        
+
     Example:
         def validate_row(row):
             if row.get('email'):
                 return {'email': row['email'].lower(), 'name': row.get('name', '')}
             return None
-        
+
         for batch in process_csv_in_batches('users.csv', validator=validate_row):
             # Process batch
             for user in batch:
@@ -238,7 +329,8 @@ def process_csv_in_batches(csv_file: str,
         csv_file=csv_file,
         batch_size=batch_size,
         validator=validator,
-        show_progress=show_progress
+        show_progress=show_progress,
+        enable_line_count=enable_line_count
     )
     
     yield from processor.process_batches()
