@@ -173,7 +173,7 @@ class OpenAlexURLExtractor:
             A tuple containing:
                 - List of URL record dictionaries with keys: doi, openalex_id, title,
                   publication_year, url, pdf_url, location_type, version, license,
-                  host_type, oa_status, is_oa
+                  host_type, oa_status, is_oa, work_type, is_retracted
                 - Dictionary with PDF statistics: {'has_pdf_urls': bool, 'pdf_url_count': int}
         """
         
@@ -209,9 +209,13 @@ class OpenAlexURLExtractor:
         
         url_records = []
         work_id = work.get('id', '')
+        # Extract numeric part from OpenAlex ID for storage efficiency
+        openalex_work_id = self._extract_openalex_work_id(work_id)
         publication_year = work.get('publication_year')
         title = work.get('title', '')
-        
+        work_type = work.get('type', '')
+        is_retracted = work.get('is_retracted', False)
+
         # Safely access nested open_access data
         open_access_data = work.get('open_access') or {}
         oa_status = open_access_data.get('oa_status', 'closed')
@@ -242,7 +246,7 @@ class OpenAlexURLExtractor:
 
             return {
                 'doi': doi,
-                'openalex_id': work_id,
+                'openalex_id': openalex_work_id or '',  # Store numeric ID for efficiency
                 'title': title,
                 'publication_year': str(publication_year) if publication_year else '',
                 'url': url,
@@ -252,7 +256,9 @@ class OpenAlexURLExtractor:
                 'license': license_info or '',
                 'host_type': host_type or '',
                 'oa_status': oa_status,
-                'is_oa': str(is_oa)
+                'is_oa': str(is_oa),
+                'work_type': work_type,
+                'is_retracted': str(is_retracted)
             }
         
         # Extract from primary location
@@ -394,6 +400,34 @@ class OpenAlexURLExtractor:
                 return False
 
         return True
+
+    def _extract_openalex_work_id(self, openalex_url: str) -> Optional[str]:
+        """
+        Extract numeric work ID from OpenAlex URL for storage efficiency.
+
+        Args:
+            openalex_url: Full OpenAlex URL like "https://openalex.org/W1982051859"
+
+        Returns:
+            Numeric part as string (e.g., "1982051859") or None if extraction fails
+        """
+        if not openalex_url:
+            return None
+
+        try:
+            # Handle full URLs like "https://openalex.org/W1982051859"
+            if 'openalex.org/W' in openalex_url:
+                return openalex_url.split('openalex.org/W')[1]
+            # Handle W-prefixed IDs like "W1982051859"
+            elif openalex_url.startswith('W'):
+                return openalex_url[1:]  # Remove the 'W' prefix
+            # If it's already just numbers, return as-is
+            elif openalex_url.isdigit():
+                return openalex_url
+            else:
+                return None
+        except (IndexError, AttributeError):
+            return None
 
     def _get_host_type(self, location: Dict[str, Any]) -> str:
         """
@@ -597,8 +631,8 @@ class OpenAlexURLExtractor:
         if self.output_format == 'csv':
             fieldnames = [
                 'doi', 'openalex_id', 'title', 'publication_year', 'url', 'pdf_url',
-                'location_type', 'version', 'license', 'host_type', 
-                'oa_status', 'is_oa'
+                'location_type', 'version', 'license', 'host_type',
+                'oa_status', 'is_oa', 'work_type', 'is_retracted'
             ]
             
             with open(self.output_file, output_mode, newline='', encoding='utf-8') as csvfile:
@@ -615,8 +649,8 @@ class OpenAlexURLExtractor:
         elif self.output_format == 'tsv':
             fieldnames = [
                 'doi', 'openalex_id', 'title', 'publication_year', 'url', 'pdf_url',
-                'location_type', 'version', 'license', 'host_type', 
-                'oa_status', 'is_oa'
+                'location_type', 'version', 'license', 'host_type',
+                'oa_status', 'is_oa', 'work_type', 'is_retracted'
             ]
             
             with open(self.output_file, output_mode, newline='', encoding='utf-8') as tsvfile:
