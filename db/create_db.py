@@ -773,23 +773,27 @@ class DatabaseCreator:
             logger.error(f"Schema verification failed: {e}")
             return False
 
-    def create_complete_schema(self, verify: bool = True) -> bool:
+    def create_complete_schema(self, verify: bool = True, create_indexes: bool = True) -> bool:
         """
         Create the complete unpaywall database schema.
 
         This method orchestrates the creation of all schema components:
         - Schema namespace
         - Tables with constraints
-        - Indexes
+        - Indexes (optional)
         - Permissions
 
         Args:
             verify: Whether to verify schema creation (default: True)
+            create_indexes: Whether to create indexes (default: True).
+                          Set to False for bulk import scenarios where indexes
+                          will be created after import completion.
 
         Returns:
             True if successful, False otherwise
         """
-        logger.info("Starting complete schema creation for unpaywall...")
+        index_msg = "with indexes" if create_indexes else "without indexes (for bulk import)"
+        logger.info(f"Starting complete schema creation for unpaywall {index_msg}...")
 
         try:
             # Test connection first
@@ -802,8 +806,14 @@ class DatabaseCreator:
             self.create_lookup_tables()
             self.create_doi_urls_table()
             self.create_import_progress_table()
-            self.create_doi_urls_indexes()
-            self.create_import_progress_indexes()
+
+            # Create indexes only if requested
+            if create_indexes:
+                self.create_doi_urls_indexes()
+                self.create_import_progress_indexes()
+            else:
+                logger.info("Skipping index creation for bulk import performance")
+
             self.set_permissions()
 
             # Verify creation if requested
@@ -895,6 +905,9 @@ Examples:
   # Create schema using .env file (database args optional)
   python db/create_db.py
 
+  # Create schema without indexes (for bulk import scenarios)
+  python db/create_db.py --no-indexes
+
   # Get schema information
   python db/create_db.py --info
 
@@ -911,6 +924,7 @@ Examples:
     parser.add_argument('--info', action='store_true', help='Show schema information')
     parser.add_argument('--test-only', action='store_true', help='Test connection only')
     parser.add_argument('--no-verify', action='store_true', help='Skip schema verification')
+    parser.add_argument('--no-indexes', action='store_true', help='Skip index creation (for bulk import scenarios)')
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
 
     args = parser.parse_args()
@@ -969,10 +983,14 @@ Examples:
         else:
             # Create complete schema
             verify = not args.no_verify
-            success = creator.create_complete_schema(verify=verify)
+            create_indexes = not args.no_indexes
+            success = creator.create_complete_schema(verify=verify, create_indexes=create_indexes)
 
             if success:
-                print("✓ Schema creation completed successfully")
+                if create_indexes:
+                    print("✓ Schema creation completed successfully")
+                else:
+                    print("✓ Schema creation completed successfully (without indexes)")
                 sys.exit(0)
             else:
                 print("✗ Schema creation failed")

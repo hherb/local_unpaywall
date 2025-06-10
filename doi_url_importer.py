@@ -40,6 +40,8 @@ Usage:
     python doi_url_importer.py --csv-file doi_urls.csv --resume
 """
 
+__version__ = 0.3
+
 import argparse
 import csv
 import hashlib
@@ -52,8 +54,8 @@ from typing import Dict, List, Any, Optional, Tuple, Generator
 from urllib.parse import urlparse
 import re
 
-from helpers.csv_utils import count_lines_fast
-
+# count_lines_fast is imported dynamically in _count_csv_rows method
+# from helpers.csv_utils import count_lines_fast
 
 try:
     from tqdm import tqdm
@@ -85,7 +87,7 @@ except ImportError:
 
 # Set up logging
 logging.basicConfig(
-    level=logging.ERROR,
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('doi_url_import.log'),
@@ -477,13 +479,14 @@ class DOIURLImporter:
             # Create DatabaseCreator instance with the same connection config
             creator = DatabaseCreator(**self.db_config)
 
-            # Create the complete schema
-            success = creator.create_complete_schema(verify=True)
+            # Create the complete schema without indexes for bulk import performance
+            # Indexes will be created after the import is complete
+            success = creator.create_complete_schema(verify=True, create_indexes=False)
 
             if not success:
                 raise RuntimeError("Schema creation failed")
 
-            logger.info("Schema creation completed successfully")
+            logger.info("Schema creation completed successfully (indexes will be created after import)")
 
         except Exception as e:
             logger.error(f"Schema creation failed: {e}")
@@ -1051,10 +1054,6 @@ class DOIURLImporter:
 
         try:
             with connection.cursor() as cur:
-                # Get count before insert
-                cur.execute("SELECT COUNT(*) FROM unpaywall.doi_urls")
-                count_before = cur.fetchone()[0]
-
                 # Use execute_many for true bulk insert performance
                 # Split into reasonable chunks to avoid memory issues
                 chunk_size = 1000  # Much larger chunks for better performance
@@ -1099,14 +1098,7 @@ class DOIURLImporter:
                         rows_inserted += chunk_inserted
                         rows_updated += chunk_updated
 
-                # Get count after insert
-                cur.execute("SELECT COUNT(*) FROM unpaywall.doi_urls")
-                count_after = cur.fetchone()[0]
-
-                # Verify counts
-                actual_diff = count_after - count_before
-                logger.info(f"Batch complete: +{actual_diff} rows in database, {rows_inserted} reported inserted, {rows_updated} conflicts")
-
+                logger.debug(f"Batch complete: {rows_inserted} reported inserted, {rows_updated} conflicts")
                 return rows_inserted, rows_updated
 
         except psycopg2.Error as e:
@@ -1187,7 +1179,7 @@ class DOIURLImporter:
 
     def run_import(self):
         """Execute the complete import process with normalized database support"""
-        logger.info("Starting DOI-URL import process with normalized database...")
+        logger.info(">>> Starting DOI-URL import process with normalized database...")
         self.stats['start_time'] = time.time()
 
         try:
@@ -1260,27 +1252,10 @@ class DOIURLImporter:
 
                     # Now try the full batch with optimized insert
                     try:
-                        # Get count before batch
-                        count_start = time.time()
-                        with conn.cursor() as cur:
-                            cur.execute("SELECT COUNT(*) FROM unpaywall.doi_urls")
-                            before_count = cur.fetchone()[0]
-                        count_time = time.time() - count_start
-
                         # Insert batch using optimized method
                         insert_start = time.time()
                         rows_inserted, rows_updated = self.insert_batch_optimized(batch, conn)
                         insert_time = time.time() - insert_start
-
-                        # Get count after batch
-                        count_start = time.time()
-                        with conn.cursor() as cur:
-                            cur.execute("SELECT COUNT(*) FROM unpaywall.doi_urls")
-                            after_count = cur.fetchone()[0]
-                        count_time += time.time() - count_start
-
-                        # Verify counts match expectations
-                        actual_diff = after_count - before_count
 
                         self.stats['rows_inserted'] += rows_inserted
                         self.stats['rows_updated'] += rows_updated
@@ -1288,8 +1263,8 @@ class DOIURLImporter:
                         batch_total_time = time.time() - batch_start_time
                         rows_per_sec = len(batch) / batch_total_time if batch_total_time > 0 else 0
 
-                        logger.info(f"Batch {batch_count} result: +{actual_diff} rows in database, {rows_inserted} reported inserted, {rows_updated} conflicts")
-                        logger.info(f"Batch {batch_count} timing: {batch_total_time:.2f}s total ({insert_time:.2f}s insert, {count_time:.2f}s counting) - {rows_per_sec:.1f} rows/sec")
+                        logger.info(f"Batch {batch_count} result: {rows_inserted} inserted, {rows_updated} conflicts")
+                        logger.info(f"Batch {batch_count} timing: {batch_total_time:.2f}s total ({insert_time:.2f}s insert) - {rows_per_sec:.1f} rows/sec")
 
                         # Update progress tracking
                         self._update_import_progress(current_row, batch_count)
@@ -1299,14 +1274,15 @@ class DOIURLImporter:
                         self._complete_import(success=False, error_message=str(e))
                         raise
 
-                    # Check database count periodically
-                    if batch_count % 10 == 0:
-                        with conn.cursor() as cur:
-                            cur.execute("SELECT COUNT(*) FROM unpaywall.doi_urls")
-                            current_count = cur.fetchone()[0]
-                            rows_per_sec = total_rows_processed / (time.time() - self.stats['start_time'])
-                            logger.info(f"Current database count: {current_count} rows (+{current_count - initial_count} from start)")
-                            logger.info(f"Current processing rate: {rows_per_sec:.1f} rows/sec")
+                    # Check database count and performance periodically (less frequently to reduce overhead)
+                    # if batch_count % 50 == 0:
+                    #     with conn.cursor() as cur:
+                    #         cur.execute("SELECT COUNT(*) FROM unpaywall.doi_urls")
+                    #         current_count = cur.fetchone()[0]
+                    #         elapsed_time = time.time() - self.stats['start_time']
+                    #         rows_per_sec = total_rows_processed / elapsed_time if elapsed_time > 0 else 0
+                    #         logger.info(f"Progress check: {current_count} rows in database (+{current_count - initial_count} from start)")
+                    #         logger.info(f"Overall processing rate: {rows_per_sec:.1f} rows/sec after {elapsed_time:.1f} seconds")
 
                     # Optional: Stop after a few batches in debug mode to check what's happening
                     # Commented out to allow full import even in debug mode
@@ -1462,6 +1438,7 @@ class DOIURLImporter:
 
 
 def main():
+    print(f"DOI URL Importer v{__version__}")
     # Check for .env configuration first
     env_config = load_env_config()
     env_available = env_config is not None
@@ -1495,8 +1472,8 @@ def main():
                         default=env_config.get('password') if env_available else None,
                         help=f'PostgreSQL password{"" if env_available else " (required)"}')
 
-    parser.add_argument('--batch-size', type=int, default=10000,
-                        help='Batch size for bulk inserts (default: 10000)')
+    parser.add_argument('--batch-size', type=int, default=25000,
+                        help='Batch size for bulk inserts (default: 25000, increase for better performance)')
     parser.add_argument('--skip-create-tables', action='store_true',
                         help='Skip table creation (tables already exist)')
     parser.add_argument('--test-only', action='store_true',
@@ -1546,6 +1523,10 @@ def main():
 
     logger.info(f"Connecting to database: {db_config['user']}@{db_config['host']}:{db_config['port']}/{db_config['database']}")
 
+    print("=" * 60)
+    print("Initializing DOI-URL import process with normalized database...")
+    print("=" * 60)
+
     # Create importer
     importer = DOIURLImporter(
         db_config=db_config,
@@ -1559,7 +1540,7 @@ def main():
     if args.list_imports:
         importer.list_import_history()
         sys.exit(0)
-
+    print("Starting import...")
     # Run the import
     importer.run_import()
 
