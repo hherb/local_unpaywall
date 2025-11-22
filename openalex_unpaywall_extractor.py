@@ -29,8 +29,6 @@ import hashlib
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Set
 from urllib.parse import urlparse
-import concurrent.futures
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from tqdm import tqdm
 
@@ -383,7 +381,7 @@ class OpenAlexURLExtractor:
             parsed = urlparse(url)
             if not parsed.scheme or not parsed.netloc:
                 return False
-        except:
+        except Exception:
             return False
 
         # Filter out obvious non-fulltext URLs

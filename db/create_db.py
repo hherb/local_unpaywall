@@ -571,7 +571,60 @@ class DatabaseCreator:
                     logger.error(f"Location type normalization failed: {e}")
                     raise
 
-    def finalize_normalization(self):
+    def normalize_database(self, verify: bool = True) -> bool:
+        """
+        Run the complete database normalization process.
+
+        This method orchestrates the normalization by:
+        1. Creating lookup tables
+        2. Adding foreign key columns
+        3. Preparing location_type for conversion
+
+        Args:
+            verify: Whether to verify the normalization (default: True)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        logger.info("Starting database normalization process...")
+
+        try:
+            # Ensure lookup tables exist
+            self.create_lookup_tables()
+
+            # Normalize location_type column (prepares for finalization)
+            self.normalize_location_type()
+
+            # Create indexes for normalized columns
+            self.create_normalized_indexes()
+
+            if verify:
+                logger.info("Verifying normalization...")
+                # Basic verification - check that lookup tables exist
+                with self.connect_db() as conn:
+                    with conn.cursor() as cur:
+                        lookup_tables = ['license', 'oa_status', 'host_type', 'work_type']
+                        for table in lookup_tables:
+                            cur.execute("""
+                                SELECT EXISTS (
+                                    SELECT FROM information_schema.tables
+                                    WHERE table_schema = 'unpaywall' AND table_name = %s
+                                )
+                            """, (table,))
+                            if not cur.fetchone()[0]:
+                                logger.error(f"Verification failed: {table} table not found")
+                                return False
+
+                logger.info("Normalization verification successful")
+
+            logger.info("Database normalization completed successfully")
+            return True
+
+        except Exception as e:
+            logger.error(f"Database normalization failed: {e}")
+            return False
+
+    def finalize_normalization(self) -> bool:
         """
         Finalize the normalization by dropping old TEXT columns and renaming new ones.
 
@@ -580,14 +633,14 @@ class DatabaseCreator:
         2. Renaming location_type_new to location_type
         3. Adding NOT NULL constraints where appropriate
 
-        Raises:
-            psycopg2.Error: If finalization fails
+        Returns:
+            True if successful, False otherwise
         """
         logger.info("Finalizing database normalization...")
 
-        with self.connect_db() as conn:
-            with conn.cursor() as cur:
-                try:
+        try:
+            with self.connect_db() as conn:
+                with conn.cursor() as cur:
                     # Drop old TEXT columns
                     old_columns = ['license', 'oa_status', 'host_type', 'work_type']
                     for column in old_columns:
@@ -624,11 +677,11 @@ class DatabaseCreator:
 
                     conn.commit()
                     logger.info("Successfully finalized database normalization")
+                    return True
 
-                except psycopg2.Error as e:
-                    conn.rollback()
-                    logger.error(f"Normalization finalization failed: {e}")
-                    raise
+        except psycopg2.Error as e:
+            logger.error(f"Normalization finalization failed: {e}")
+            return False
 
     def create_normalized_indexes(self):
         """

@@ -65,17 +65,34 @@ class DOIURLRecord:
 
 class NormalizedHelper:
     """Helper class for working with the normalized database structure."""
-    
+
+    # Valid lookup table names (whitelist for SQL safety)
+    VALID_LOOKUP_TABLES = frozenset(['license', 'oa_status', 'host_type', 'work_type'])
+
     def __init__(self, db_config: Dict[str, Any]):
         """
         Initialize the helper with database configuration.
-        
+
         Args:
             db_config: Database connection parameters
         """
         self.db_config = db_config
         self._lookup_cache = {}  # Cache for lookup table values
-    
+
+    def _validate_lookup_table_name(self, table_name: str) -> None:
+        """
+        Validate that a table name is in the allowed whitelist.
+
+        Args:
+            table_name: Name of the lookup table to validate
+
+        Raises:
+            ValueError: If the table name is not in the whitelist
+        """
+        if table_name not in self.VALID_LOOKUP_TABLES:
+            raise ValueError(f"Invalid lookup table name: {table_name}. "
+                           f"Valid tables: {', '.join(sorted(self.VALID_LOOKUP_TABLES))}")
+
     def connect_db(self):
         """Establish database connection."""
         return psycopg2.connect(**self.db_config)
@@ -83,23 +100,23 @@ class NormalizedHelper:
     def normalize_location_type(self, location_type: str) -> str:
         """
         Convert location_type text to CHAR(1) representation.
-        
+
         Args:
-            location_type: Text location type (primary, alternate, best_oa, etc.)
-            
+            location_type: Text location type (primary, alternate, best_oa, secondary, etc.)
+
         Returns:
-            Single character: 'p' for primary, 'a' for alternate, 'b' for best_oa
+            Single character: 'p' for primary, 'a' for alternate/secondary, 'b' for best_oa
         """
         if not location_type:
             return 'p'
-        
+
         location_lower = location_type.lower().strip()
-        
+
         if location_lower in ['primary', 'p']:
             return 'p'
-        elif location_lower in ['alternate', 'a']:
+        elif location_lower in ['alternate', 'alternative', 'secondary', 'a']:
             return 'a'
-        elif location_lower in ['best_oa', 'b']:
+        elif location_lower in ['best_oa', 'best', 'b']:
             return 'b'
         else:
             # Default to primary for unknown values
@@ -108,20 +125,23 @@ class NormalizedHelper:
     def get_or_create_lookup_id(self, table_name: str, value: Optional[str]) -> Optional[int]:
         """
         Get or create a lookup table entry and return its ID.
-        
+
         Args:
             table_name: Name of the lookup table (license, oa_status, host_type, work_type)
             value: The value to look up or create
-            
+
         Returns:
             The ID of the lookup entry, or None if value is empty
         """
         if not value or not value.strip():
             return None
-        
+
+        # Validate table name to prevent SQL injection
+        self._validate_lookup_table_name(table_name)
+
         value = value.strip()
         cache_key = f"{table_name}:{value}"
-        
+
         # Check cache first
         if cache_key in self._lookup_cache:
             return self._lookup_cache[cache_key]
@@ -236,19 +256,22 @@ class NormalizedHelper:
     def get_lookup_value(self, table_name: str, lookup_id: int) -> Optional[str]:
         """
         Get the text value for a lookup table ID.
-        
+
         Args:
             table_name: Name of the lookup table
             lookup_id: The ID to look up
-            
+
         Returns:
             The text value, or None if not found
         """
         if not lookup_id:
             return None
-        
+
+        # Validate table name to prevent SQL injection
+        self._validate_lookup_table_name(table_name)
+
         cache_key = f"{table_name}_id:{lookup_id}"
-        
+
         # Check cache first
         if cache_key in self._lookup_cache:
             return self._lookup_cache[cache_key]
