@@ -40,7 +40,7 @@ Usage:
     python doi_url_importer.py --csv-file doi_urls.csv --resume
 """
 
-__version__ = 0.3
+__version__ = "0.3"
 
 import argparse
 import csv
@@ -141,6 +141,9 @@ def load_env_config() -> Optional[Dict[str, str]]:
 
 
 class DOIURLImporter:
+    # Valid lookup table names (whitelist for SQL safety)
+    VALID_LOOKUP_TABLES = frozenset(['license', 'oa_status', 'host_type', 'work_type'])
+
     def __init__(self, db_config: Dict[str, Any], csv_file: str,
                  batch_size: int = 10000, create_tables: bool = True, resume: bool = False):
         self.db_config = db_config
@@ -191,6 +194,20 @@ class DOIURLImporter:
             logger.error(f"Database connection failed: {e}")
             raise
 
+    def _validate_lookup_table_name(self, table_name: str) -> None:
+        """
+        Validate that a table name is in the allowed whitelist.
+
+        Args:
+            table_name: Name of the lookup table to validate
+
+        Raises:
+            ValueError: If the table name is not in the whitelist
+        """
+        if table_name not in self.VALID_LOOKUP_TABLES:
+            raise ValueError(f"Invalid lookup table name: {table_name}. "
+                           f"Valid tables: {', '.join(sorted(self.VALID_LOOKUP_TABLES))}")
+
     def get_or_create_lookup_id(self, table_name: str, value: str, connection=None) -> Optional[int]:
         """
         Get or create a lookup table entry and return its ID with caching.
@@ -207,6 +224,9 @@ class DOIURLImporter:
         """
         if not value or not value.strip():
             return None
+
+        # Validate table name to prevent SQL injection
+        self._validate_lookup_table_name(table_name)
 
         value = value.strip()
 
@@ -292,6 +312,8 @@ class DOIURLImporter:
 
         with connection.cursor() as cur:
             for table_name, values in lookup_values.items():
+                # Validate table name to prevent SQL injection
+                self._validate_lookup_table_name(table_name)
                 if not values:
                     continue
 
@@ -336,10 +358,10 @@ class DOIURLImporter:
         Convert location type text to single character format.
 
         Args:
-            location_type: Text location type (primary, alternate, best_oa, etc.)
+            location_type: Text location type (primary, alternate, best_oa, secondary, etc.)
 
         Returns:
-            Single character: 'p' for primary, 'a' for alternate, 'b' for best_oa
+            Single character: 'p' for primary, 'a' for alternate/secondary, 'b' for best_oa
         """
         if not location_type:
             return 'p'  # Default to primary
@@ -349,7 +371,7 @@ class DOIURLImporter:
         # Map common variations
         if location_type in ['primary', 'p']:
             return 'p'
-        elif location_type in ['alternate', 'alternative', 'a']:
+        elif location_type in ['alternate', 'alternative', 'secondary', 'a']:
             return 'a'
         elif location_type in ['best_oa', 'best', 'b']:
             return 'b'
@@ -684,7 +706,7 @@ class DOIURLImporter:
         try:
             parsed = urlparse(url)
             return bool(parsed.scheme and parsed.netloc)
-        except:
+        except Exception:
             return False
 
     def _safe_int(self, value: Optional[str]) -> Optional[int]:
@@ -725,7 +747,6 @@ class DOIURLImporter:
                 return int(value[1:])  # Remove the 'W' prefix
 
             # Try to extract any numeric part
-            import re
             numeric_match = re.search(r'\d+', value)
             if numeric_match:
                 return int(numeric_match.group())
@@ -1540,6 +1561,17 @@ def main():
     if args.list_imports:
         importer.list_import_history()
         sys.exit(0)
+
+    # Test connection only if requested
+    if args.test_only:
+        print("Testing database connection...")
+        if importer.test_database_connection():
+            print("Database connection test successful!")
+            sys.exit(0)
+        else:
+            print("Database connection test failed!")
+            sys.exit(1)
+
     print("Starting import...")
     # Run the import
     importer.run_import()
