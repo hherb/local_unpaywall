@@ -1,752 +1,459 @@
 # Local Unpaywall
 
-A comprehensive system for mirroring open access URLs for scientific publications on a local PostgreSQL server. This project extracts DOI-URL mappings from OpenAlex snapshots and provides efficient tools for processing, importing, and managing large-scale academic publication data.
+A high-performance system for creating a local mirror of open access publication URLs from OpenAlex snapshots. Designed to handle massive datasets (250M+ records, 400GB+ compressed) with memory-efficient processing, resume capability, and robust error handling.
 
 ![Paywall Breaker Sketch](assets/paywallbreaker_sketch_small.png)
 
-## Overview
+## Key Features
 
-Local Unpaywall creates a local mirror of open access publication URLs by:
+- **Scalable**: Process 250M+ DOI-URL records from OpenAlex snapshots
+- **Memory-Efficient**: Generator-based processing with constant memory usage
+- **Fault-Tolerant**: SHA-256 hash-based progress tracking enables safe resume
+- **Storage-Optimized**: Normalized database schema saves 17-40GB on full dataset
+- **Flexible**: Filter by year, OA status, work type; output to CSV/JSON/TSV
 
-1. **Extracting** DOI and URL pairs from OpenAlex snapshot data
-2. **Processing** compressed JSONL files with memory-efficient algorithms
-3. **Importing** the data into PostgreSQL for fast lookups
-4. **Tracking** processed files to enable incremental updates
+## Quick Start
 
-The system is designed to handle massive datasets (hundreds of GB) efficiently while providing resume capability, progress tracking, and robust error handling.
+```bash
+# Install dependencies
+pip install psycopg2-binary tqdm requests python-dotenv
+
+# Configure database (.env file)
+echo "POSTGRES_HOST=localhost
+POSTGRES_DB=unpaywall
+POSTGRES_USER=myuser
+POSTGRES_PASSWORD=mypass" > .env
+
+# Create database schema
+python db/create_db.py
+
+# Extract URLs from OpenAlex snapshot
+python openalex_unpaywall_extractor.py \
+    --snapshot-dir ./openalex-snapshot \
+    --output urls.csv \
+    --oa-only --resume
+
+# Import to PostgreSQL
+python doi_url_importer.py --csv-file urls.csv --resume
+
+# Query your data
+psql -d unpaywall -c "SELECT url FROM unpaywall.doi_urls WHERE doi = '10.1038/nature12373'"
+```
+
+See [QUICKSTART.md](QUICKSTART.md) for detailed setup instructions.
 
 ## Architecture
 
-### Core Components
-
-- **OpenAlex URL Extractor** (`openalex_unpaywall_extractor.py`): Extracts DOI-URL pairs from OpenAlex snapshots
-- **DOI-URL Importer** (`doi_url_importer.py`): Imports extracted data into PostgreSQL
-- **PDF Fetcher** (`pdf_fetcher.py`): Downloads PDF files from URLs with progress tracking and resume capability
-- **File Tracking System** (`helpers/file_tracker.py`): SQLite-based tracking for incremental processing
-- **CSV Processing Utilities** (`helpers/csv_utils.py`): Memory-efficient processing of large CSV files
-
-### Data Flow
-
 ```
-OpenAlex Snapshot → URL Extractor → CSV File → Database Importer → PostgreSQL
-                         ↓                              ↓
-                  File Tracker (SQLite)          PDF Fetcher
-                                                      ↓
-                                               Downloaded PDFs
+OpenAlex Snapshot (384GB)
+         │
+         ▼
+┌─────────────────────────────────┐
+│ openalex_unpaywall_extractor.py │  ← Stream compressed JSONL
+│ + FileTracker (SQLite)          │  ← Resume capability
+└─────────────────────────────────┘
+         │
+         ▼
+    CSV/JSON/TSV
+         │
+         ▼
+┌─────────────────────────────────┐
+│ doi_url_importer.py             │  ← Batch processing
+│ + CSVBatchProcessor             │  ← Memory-efficient
+└─────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────┐
+│ PostgreSQL                      │
+│ (Normalized Schema)             │  ← 17-40GB storage savings
+└─────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────┐
+│ pdf_fetcher.py                  │  ← Download full-text PDFs
+└─────────────────────────────────┘
 ```
 
-## Main Scripts
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [QUICKSTART.md](QUICKSTART.md) | Get started in 5 minutes |
+| [DEVELOPERS.md](DEVELOPERS.md) | Complete API reference |
+| [NORMALIZED_DATABASE.md](NORMALIZED_DATABASE.md) | Database schema details |
+
+## Core Components
 
 ### 1. OpenAlex URL Extractor
 
-**File**: `openalex_unpaywall_extractor.py`
+Extracts DOI-URL pairs from OpenAlex snapshot files.
 
-Extracts DOI and full text URL pairs directly from OpenAlex snapshot data without requiring a database import first.
-
-**Key Features**:
-- Processes compressed JSONL files directly
-- Extracts multiple URLs per DOI when available
-- Filters by open access status, publication year, work type
-- Outputs to CSV, JSON, or TSV format
-- SQLite-based file tracking for resume capability
-- Memory-efficient processing with progress tracking
-
-**Usage**:
 ```bash
 python openalex_unpaywall_extractor.py \
-    --snapshot-dir /path/to/openalex-snapshot \
+    --snapshot-dir /path/to/openalex \
     --output urls.csv \
     --format csv \
     --oa-only \
     --year-from 2020 \
-    --resume
-```
-
-**Output Format**:
-The extractor produces CSV files with columns:
-- `doi`: DOI identifier (e.g., "10.1103/physrevd.103.035013")
-- `openalex_id`: OpenAlex work identifier
-- `title`: Publication title
-- `publication_year`: Year of publication
-- `url`: Full text URL
-- `pdf_url`: Direct PDF URL (when available)
-- `location_type`: Source type (repository, publisher, etc.)
-- `version`: Version information (publishedVersion, acceptedVersion, etc.)
-- `license`: License information
-- `host_type`: Host type (publisher, repository, domain)
-- `oa_status`: Open access status
-- `is_oa`: Boolean indicating open access status
-
-### 2. DOI-URL Database Importer
-
-**File**: `doi_url_importer.py`
-
-Imports the CSV file generated by the URL extractor into PostgreSQL tables for efficient DOI-URL mapping.
-
-**Key Features**:
-- Efficient batch processing with configurable batch sizes
-- Data validation and cleaning
-- Duplicate handling with upsert capability
-- URL quality scoring based on source characteristics
-- Progress tracking and comprehensive logging
-- Resume functionality for interrupted imports
-
-**Usage**:
-```bash
-python doi_url_importer.py \
-    --csv-file urls.csv \
-    --db-name biomedical \
-    --db-user myuser \
-    --db-password mypass \
-    --batch-size 10000
-```
-
-### 3. PDF Fetcher
-
-**File**: `pdf_fetcher.py`
-
-Downloads PDF files from URLs with progress tracking, resume capability, and robust error handling.
-
-**Key Features**:
-- Downloads PDFs from specified URLs with tqdm progress bars
-- Resume capability for interrupted downloads using HTTP range requests
-- PDF content validation to ensure downloaded files are actually PDFs
-- Flexible filename handling (custom names or extracted from URLs)
-- Robust error handling for network issues and file I/O
-- Command-line interface and Python module usage
-
-**Command-Line Usage**:
-```bash
-# Basic download with original filename
-python pdf_fetcher.py "https://example.com/paper.pdf" "./downloads/"
-
-# Download with custom filename
-python pdf_fetcher.py "https://example.com/paper.pdf" "./downloads/" --filename "my_paper.pdf"
-
-# Download with custom settings
-python pdf_fetcher.py "https://example.com/paper.pdf" "./downloads/" \
-    --chunk-size 16384 \
-    --timeout 60 \
-    --verbose
-```
-
-**Python Module Usage**:
-```python
-from pdf_fetcher import PDFFetcher
-
-# Create fetcher instance
-fetcher = PDFFetcher()
-
-# Download a PDF
-success, message = fetcher.download_pdf(
-    url="https://example.com/paper.pdf",
-    output_dir="./downloads/",
-    filename="my_paper.pdf"  # Optional
-)
-
-if success:
-    print(f"Success: {message}")
-else:
-    print(f"Error: {message}")
-```
-
-**Batch Download Example**:
-```python
-# Download PDFs from database URLs
-import sqlite3
-from pdf_fetcher import PDFFetcher
-
-fetcher = PDFFetcher()
-conn = sqlite3.connect("papers.db")
-
-cursor = conn.execute("SELECT doi, pdf_url FROM papers WHERE pdf_downloaded = 0")
-for doi, pdf_url in cursor:
-    filename = f"{doi.replace('/', '_')}.pdf"
-    success, message = fetcher.download_pdf(pdf_url, "./pdfs/", filename)
-
-    if success:
-        conn.execute("UPDATE papers SET pdf_downloaded = 1 WHERE doi = ?", (doi,))
-        conn.commit()
-        print(f"✓ Downloaded: {doi}")
-    else:
-        print(f"✗ Failed: {doi} - {message}")
-
-conn.close()
-```
-
-## Database Schema
-
-The system creates optimized PostgreSQL tables for fast DOI-URL lookups:
-
-### Main Table: `doi_urls`
-
-```sql
-CREATE TABLE doi_urls (
-    id BIGSERIAL PRIMARY KEY,
-    doi TEXT NOT NULL,                    -- DOI identifier only
-    url TEXT NOT NULL,                    -- Full text URL
-    pdf_url TEXT,                         -- Direct PDF URL
-    openalex_id BIGINT,                   -- OpenAlex work ID (numeric part only)
-    title TEXT,                           -- Publication title
-    publication_year INTEGER,             -- Publication year
-    location_type TEXT NOT NULL,          -- Source type
-    version TEXT,                         -- Version info
-    license TEXT,                         -- License
-    host_type TEXT,                       -- Host type
-    oa_status TEXT,                       -- OA status
-    is_oa BOOLEAN DEFAULT FALSE,          -- OA flag
-    work_type TEXT,                       -- Work type (journal-article, book-chapter, etc.)
-    is_retracted BOOLEAN DEFAULT FALSE,   -- Whether the work is retracted
-    url_quality_score INTEGER DEFAULT 50, -- Quality score
-    last_verified TIMESTAMP,              -- Last verification
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(doi, url)                      -- Prevent duplicates
-);
-```
-
-### Indexes for Performance
-
-```sql
-CREATE INDEX idx_doi_urls_doi ON doi_urls(doi);
-CREATE INDEX idx_doi_urls_url ON doi_urls(url);
-CREATE INDEX idx_doi_urls_pdf_url ON doi_urls(pdf_url) WHERE pdf_url IS NOT NULL;
-CREATE INDEX idx_doi_urls_oa_status ON doi_urls(oa_status) WHERE is_oa = TRUE;
-CREATE INDEX idx_doi_urls_work_type ON doi_urls(work_type);
-CREATE INDEX idx_doi_urls_is_retracted ON doi_urls(is_retracted);
-```
-
-## Complete Workflow
-
-### Step 0: Prerequisites
-
-1. **Install Dependencies**:
-```bash
-pip install psycopg2-binary tqdm requests
-```
-
-2. **Set up PostgreSQL Database**:
-```bash
-createdb biomedical
-```
-
-3. **Create Database Schema**:
-```bash
-psql -d biomedical -f doi_url_schema.sql
-```
-
-### Step 1: Download OpenAlex Snapshot
-
-Download the OpenAlex "works" section (384GB compressed as of May 2024):
-
-```bash
-aws s3 sync "s3://openalex/data/works" "openalex-snapshot/data/works" --no-sign-request
-```
-
-**Alternative**: Download complete OpenAlex snapshot (446GB compressed):
-```bash
-aws s3 sync "s3://openalex" "openalex-snapshot" --no-sign-request
-```
-
-### Step 2: Extract DOI-URL Pairs
-
-Extract URLs from the snapshot data:
-
-```bash
-python openalex_unpaywall_extractor.py \
-    --snapshot-dir openalex-snapshot \
-    --output doi_urls.csv \
-    --format csv \
-    --oa-only \
     --exclude-retracted \
     --resume
 ```
 
-**Advanced Filtering Options**:
-```bash
-# Extract only recent publications
-python openalex_unpaywall_extractor.py \
-    --snapshot-dir openalex-snapshot \
-    --output recent_urls.csv \
-    --year-from 2020 \
-    --year-to 2024 \
-    --types journal-article book-chapter \
-    --oa-only
-```
+**Features**:
+- Processes compressed JSONL directly (no decompression needed)
+- Extracts multiple URLs per DOI with metadata
+- SQLite-based progress tracking with hash verification
+- Filters: year range, OA status, work type, retraction status
 
-### Step 3: Import into PostgreSQL
+### 2. DOI-URL Importer
 
-Import the extracted CSV data:
+Imports extracted data into PostgreSQL with normalized schema.
 
 ```bash
 python doi_url_importer.py \
-    --csv-file doi_urls.csv \
-    --db-name biomedical \
-    --db-user myuser \
-    --db-password mypass \
-    --batch-size 10000 \
-    --create-tables
+    --csv-file urls.csv \
+    --batch-size 25000 \
+    --resume
 ```
 
-### Step 4: Query and Use the Data
+**Features**:
+- Batch processing with configurable batch sizes
+- Lookup table caching for high-performance inserts
+- Upsert handling (ON CONFLICT DO UPDATE)
+- Resume from interruption with file integrity checking
+- Supports `.env` file for database credentials
 
-Example queries:
+### 3. PDF Fetcher
 
-```sql
--- Find all open access URLs for a specific DOI
-SELECT url, pdf_url, location_type, version
-FROM doi_urls
-WHERE doi = '10.1103/physrevd.103.035013'
-AND is_oa = TRUE;
-
--- Get publication statistics by year
-SELECT publication_year, COUNT(*) as publications,
-       COUNT(CASE WHEN is_oa THEN 1 END) as open_access
-FROM doi_urls
-GROUP BY publication_year
-ORDER BY publication_year DESC;
-
--- Find highest quality URLs for a DOI
-SELECT url, pdf_url, url_quality_score, location_type
-FROM doi_urls
-WHERE doi = '10.1038/s41586-021-03819-2'
-ORDER BY url_quality_score DESC;
-```
-
-### Step 5: Download PDFs (Optional)
-
-Use the PDF fetcher to download full-text PDFs:
+Downloads PDFs with progress tracking and resume capability.
 
 ```bash
-# Download a single PDF
-python pdf_fetcher.py "https://example.com/paper.pdf" "./downloads/" --filename "paper.pdf"
+python pdf_fetcher.py "https://example.com/paper.pdf" "./downloads/"
+```
 
-# Batch download from database
-python -c "
+```python
+from pdf_fetcher import PDFFetcher
+
+fetcher = PDFFetcher()
+success, msg = fetcher.download_pdf(url, "./pdfs/", "paper.pdf")
+```
+
+**Features**:
+- HTTP range requests for resume
+- PDF header validation
+- Progress bars with tqdm
+
+### 4. Helper Modules
+
+#### File Tracker (`helpers/file_tracker.py`)
+
+SQLite-based tracking for incremental processing.
+
+```python
+from helpers.file_tracker import FileTracker
+
+tracker = FileTracker("progress.db")
+if tracker.needs_processing("file.gz"):
+    process_file("file.gz")
+    tracker.mark_completed("file.gz", {'records': 50000})
+```
+
+#### CSV Utilities (`helpers/csv_utils.py`)
+
+Memory-efficient batch processing for large CSV files.
+
+```python
+from helpers.csv_utils import process_csv_in_batches
+
+for batch in process_csv_in_batches("large.csv", batch_size=10000):
+    insert_batch(batch)
+```
+
+## Database Schema
+
+The system uses a normalized PostgreSQL schema optimized for storage efficiency:
+
+```sql
+-- Main table (unpaywall.doi_urls)
+CREATE TABLE unpaywall.doi_urls (
+    id BIGSERIAL PRIMARY KEY,
+    doi TEXT NOT NULL,
+    url TEXT NOT NULL,
+    pdf_url TEXT,
+    openalex_id BIGINT,
+    title TEXT,
+    publication_year INTEGER,
+    location_type CHAR(1) NOT NULL,  -- 'p', 'a', 'b'
+    version TEXT,
+    license_id INTEGER REFERENCES unpaywall.license(id),
+    host_type_id INTEGER REFERENCES unpaywall.host_type(id),
+    oa_status_id INTEGER REFERENCES unpaywall.oa_status(id),
+    work_type_id INTEGER REFERENCES unpaywall.work_type(id),
+    is_oa BOOLEAN DEFAULT FALSE,
+    is_retracted BOOLEAN DEFAULT FALSE,
+    url_quality_score INTEGER DEFAULT 50,
+    UNIQUE(doi, url)
+);
+
+-- Lookup tables for storage efficiency
+-- unpaywall.license, unpaywall.oa_status, unpaywall.host_type, unpaywall.work_type
+```
+
+**Storage Savings**: 70-160 bytes per row → 17-40GB for 250M records
+
+See [NORMALIZED_DATABASE.md](NORMALIZED_DATABASE.md) for complete schema documentation.
+
+## Example Queries
+
+```sql
+-- Find all URLs for a DOI
+SELECT d.url, d.pdf_url, l.value AS license
+FROM unpaywall.doi_urls d
+LEFT JOIN unpaywall.license l ON d.license_id = l.id
+WHERE d.doi = '10.1038/nature12373';
+
+-- Count open access articles by status
+SELECT o.value AS oa_status, COUNT(*) AS count
+FROM unpaywall.doi_urls d
+JOIN unpaywall.oa_status o ON d.oa_status_id = o.id
+WHERE d.is_oa = TRUE
+GROUP BY o.value
+ORDER BY count DESC;
+
+-- Find CC-BY licensed articles from 2024
+SELECT d.doi, d.url, d.title
+FROM unpaywall.doi_urls d
+JOIN unpaywall.license l ON d.license_id = l.id
+WHERE l.value = 'cc-by' AND d.publication_year = 2024
+LIMIT 100;
+```
+
+## Complete Workflow
+
+### Step 1: Download OpenAlex Snapshot
+
+```bash
+# Works section only (~384GB compressed)
+aws s3 sync "s3://openalex/data/works" "./openalex-snapshot/data/works" --no-sign-request
+```
+
+### Step 2: Configure Database
+
+```bash
+# Create .env file
+cat > .env << EOF
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5432
+POSTGRES_DB=unpaywall
+POSTGRES_USER=myuser
+POSTGRES_PASSWORD=mypass
+EOF
+
+# Create database and schema
+createdb unpaywall
+python db/create_db.py
+```
+
+### Step 3: Extract and Import
+
+```bash
+# Extract DOI-URL pairs (with resume capability)
+python openalex_unpaywall_extractor.py \
+    --snapshot-dir ./openalex-snapshot \
+    --output doi_urls.csv \
+    --oa-only \
+    --exclude-retracted \
+    --resume
+
+# Import to PostgreSQL (with resume capability)
+python doi_url_importer.py \
+    --csv-file doi_urls.csv \
+    --batch-size 25000 \
+    --resume
+```
+
+### Step 4: Download PDFs (Optional)
+
+```python
 from pdf_fetcher import PDFFetcher
 import psycopg2
 
 fetcher = PDFFetcher()
-conn = psycopg2.connect('dbname=biomedical user=myuser password=mypass')
-cursor = conn.cursor()
-
-cursor.execute('SELECT doi, pdf_url FROM doi_urls WHERE pdf_url IS NOT NULL LIMIT 100')
-for doi, pdf_url in cursor:
-    filename = f'{doi.replace(\"/\", \"_\")}.pdf'
-    success, message = fetcher.download_pdf(pdf_url, './pdfs/', filename)
-    print(f'{'✓' if success else '✗'} {doi}: {message}')
-
-conn.close()
-"
-```
-
-## Advanced Features
-
-### File Tracking System
-
-The system includes a sophisticated SQLite-based file tracking system that enables:
-
-- **Incremental Processing**: Only processes changed files during subsequent runs
-- **Hash-based Change Detection**: Uses SHA-256 hashing to detect file modifications
-- **Resume Capability**: Safely resume interrupted processing sessions
-- **Processing Statistics**: Tracks detailed statistics per file
-
-**How it works**:
-1. Creates a `.tracking.db` file alongside the output file
-2. Calculates SHA-256 hash for each input file
-3. Skips files that haven't changed since last processing
-4. Automatically migrates from legacy `.progress` files
-
-**Example**:
-```bash
-# Initial run - processes all files
-python openalex_unpaywall_extractor.py --snapshot-dir data --output urls.csv --resume
-
-# Subsequent run - only processes new/changed files
-python openalex_unpaywall_extractor.py --snapshot-dir data --output urls.csv --resume
-```
-
-### Memory-Efficient Processing
-
-Both the extractor and importer use memory-efficient algorithms to handle large datasets:
-
-**CSV Processing**:
-- Generator-based batch processing for constant memory usage
-- Configurable batch sizes (default: 10,000 rows)
-- Progress tracking with tqdm
-- Automatic delimiter detection
-
-**Benefits**:
-- Process files larger than available RAM
-- Constant memory usage regardless of file size
-- Better performance on resource-constrained systems
-
-### Data Quality Features
-
-**URL Quality Scoring**: The importer assigns quality scores based on:
-- Source type (publisher > repository > domain)
-- Version information (published > accepted > submitted)
-- License availability
-- Host reputation
-
-**Data Validation**:
-- DOI format validation and normalization
-- URL validation and cleaning
-- Duplicate detection and handling
-- Conflict resolution (newer data overwrites older, but preserves existing PDF URLs)
-
-### Error Handling and Logging
-
-**Comprehensive Logging**:
-- Detailed processing logs with timestamps
-- Error tracking and recovery suggestions
-- Performance metrics and statistics
-
-**Robust Error Handling**:
-- Graceful handling of malformed JSON data
-- Network timeout handling for downloads
-- Database connection recovery
-- File permission and access error handling
-
-## Configuration and Customization
-
-### Environment Variables
-
-```bash
-# Database configuration
-export DB_HOST=localhost
-export DB_PORT=5432
-export DB_NAME=biomedical
-export DB_USER=myuser
-export DB_PASSWORD=mypass
-
-# Processing configuration
-export BATCH_SIZE=10000
-export MAX_WORKERS=4
-```
-
-### Filtering Options
-
-The extractor supports extensive filtering:
-
-```bash
-# Year range filtering
---year-from 2020 --year-to 2024
-
-# Work type filtering
---types journal-article book-chapter preprint
-
-# Open access only
---oa-only
-
-# Exclude retracted works
---exclude-retracted
-```
-
-### Output Formats
-
-Multiple output formats are supported:
-
-```bash
-# CSV (default)
---format csv
-
-# JSON
---format json
-
-# Tab-separated values
---format tsv
-```
-
-## Performance Optimization
-
-### Recommended Settings
-
-**For Large Datasets (>100GB)**:
-```bash
-# Use larger batch sizes for better performance
-python doi_url_importer.py --batch-size 50000
-
-# Enable parallel processing where possible
-python openalex_unpaywall_extractor.py --max-workers 8
-```
-
-**For Memory-Constrained Systems**:
-```bash
-# Use smaller batch sizes
-python doi_url_importer.py --batch-size 5000
-
-# Process sequentially
-python openalex_unpaywall_extractor.py --max-workers 1
-```
-
-### Database Optimization
-
-**PostgreSQL Configuration**:
-```sql
--- Increase work memory for large imports
-SET work_mem = '256MB';
-
--- Disable autovacuum during large imports
-ALTER TABLE doi_urls SET (autovacuum_enabled = false);
-
--- Re-enable after import
-ALTER TABLE doi_urls SET (autovacuum_enabled = true);
-```
-
-## Monitoring and Maintenance
-
-### Progress Monitoring
-
-Both scripts provide detailed progress information:
-
-```
-Processing OpenAlex files: 45%|████▌     | 1234/2750 [02:15<02:45, 9.12files/s]
-Importing CSV data: 78%|███████▊  | 780K/1M [05:23<01:15, 2.41Krows/s]
-```
-
-### Log Analysis
-
-Check processing logs for issues:
-
-```bash
-# Extractor logs
-tail -f openalex_url_extraction.log
-
-# Importer logs
-tail -f doi_url_import.log
-```
-
-### Database Maintenance
-
-Regular maintenance tasks:
-
-```sql
--- Update table statistics
-ANALYZE doi_urls;
-
--- Vacuum to reclaim space
-VACUUM ANALYZE doi_urls;
-
--- Check index usage
-SELECT schemaname, tablename, indexname, idx_scan, idx_tup_read, idx_tup_fetch
-FROM pg_stat_user_indexes
-WHERE tablename = 'doi_urls';
-```
-
-## Testing
-
-The project includes comprehensive tests in the `test/` directory:
-
-### Running Tests
-
-```bash
-# Run all tests
-python test/run_all_tests.py
-
-# Run specific test modules
-python -m pytest test/test_file_tracker.py -v
-python -m pytest test/test_csv_utils.py -v
-python -m pytest test/test_integration.py -v
-```
-
-### Test Categories
-
-- **Unit Tests**: Test individual components (file tracker, CSV utils)
-- **Integration Tests**: Test complete workflows with sample data
-- **Performance Tests**: Memory usage and processing speed validation
-
-### Creating Test Data
-
-```bash
-# Create sample OpenAlex data for testing
-python test/create_test_data.py --works 1000 --output test_snapshot/
-```
-
-## Troubleshooting
-
-### Common Issues
-
-**1. Memory Issues**
-```
-Error: MemoryError during CSV processing
-```
-**Solution**: Reduce batch size:
-```bash
-python doi_url_importer.py --batch-size 1000
-```
-
-**2. Database Connection Issues**
-```
-Error: psycopg2.OperationalError: could not connect to server
-```
-**Solution**: Check database configuration:
-```bash
-# Test connection
-psql -h localhost -U myuser -d biomedical -c "SELECT 1;"
-```
-
-**3. File Permission Issues**
-```
-Error: Permission denied: '/path/to/openalex-snapshot'
-```
-**Solution**: Check file permissions:
-```bash
-chmod -R 755 openalex-snapshot/
-```
-
-**4. Disk Space Issues**
-```
-Error: No space left on device
-```
-**Solution**: Monitor disk usage and clean up temporary files:
-```bash
-df -h
-rm -f *.tmp *.log.old
-```
-
-### Debug Mode
-
-Enable verbose logging for troubleshooting:
-
-```bash
-# Set debug logging level
-export LOG_LEVEL=DEBUG
-
-# Run with verbose output
-python openalex_unpaywall_extractor.py --snapshot-dir data --output urls.csv -v
-```
-
-### Recovery Procedures
-
-**Corrupted Tracking Database**:
-```bash
-# Remove corrupted tracking file to restart
-rm urls.tracking.db
-
-# Re-run with resume flag
-python openalex_unpaywall_extractor.py --resume
-```
-
-**Interrupted Database Import**:
-```bash
-# Check import progress
-SELECT COUNT(*) FROM doi_urls;
-
-# List recent import history
-python doi_url_importer.py --csv-file urls.csv --db-name biomedical \
-    --db-user myuser --db-password mypass --list-imports
-
-# Resume import from where it left off
-python doi_url_importer.py --csv-file urls.csv --db-name biomedical \
-    --db-user myuser --db-password mypass --resume
+conn = psycopg2.connect("dbname=unpaywall")
+cur = conn.cursor()
+
+cur.execute("SELECT doi, pdf_url FROM unpaywall.doi_urls WHERE pdf_url IS NOT NULL LIMIT 100")
+for doi, pdf_url in cur:
+    filename = f"{doi.replace('/', '_')}.pdf"
+    success, msg = fetcher.download_pdf(pdf_url, "./pdfs/", filename)
+    print(f"{'OK' if success else 'FAIL'}: {doi}")
 ```
 
 ## Project Structure
 
 ```
 local_unpaywall/
-├── README.md                           # This file
-├── pyproject.toml                      # Project configuration
-├── doi_url_schema.sql                  # Database schema
-├── openalex_unpaywall_extractor.py     # Main extraction script
-├── doi_url_importer.py                 # Database import script
-├── pdf_fetcher.py                      # PDF download utility
-├── helpers/                            # Utility modules
+├── openalex_unpaywall_extractor.py  # Extract DOI-URLs from OpenAlex
+├── doi_url_importer.py              # Import to PostgreSQL
+├── pdf_fetcher.py                   # Download PDFs
+├── normalize_database.py            # Database normalization script
+│
+├── helpers/
 │   ├── __init__.py
-│   ├── file_tracker.py                 # File tracking system
-│   └── csv_utils.py                    # Memory-efficient CSV processing
-├── manual/                             # Documentation
-│   ├── file_tracking_system.md
-│   ├── memory_efficient_csv_processing.md
-│   ├── pdf_fetcher.md
-│   └── testing_guide.md
-└── test/                               # Test suite
-    ├── __init__.py
-    ├── run_all_tests.py
-    ├── test_file_tracker.py
-    ├── test_csv_utils.py
-    ├── test_pdf_fetcher.py
-    └── test_integration.py
+│   ├── file_tracker.py              # SQLite progress tracking
+│   └── csv_utils.py                 # Memory-efficient CSV processing
+│
+├── db/
+│   ├── create_db.py                 # Schema creation
+│   ├── normalized_helpers.py        # Database utilities
+│   ├── run_migration.py             # Migration runner
+│   └── migrations/                  # SQL migration scripts
+│       ├── 001_add_work_type_and_is_retracted.sql
+│       ├── 002_optimize_openalex_id_storage.sql
+│       ├── 003_create_unpaywall_schema.sql
+│       └── 004_normalize_database_storage.sql
+│
+├── test/                            # Test suite
+│   ├── test_file_tracker.py
+│   ├── test_csv_utils.py
+│   ├── test_pdf_fetcher.py
+│   ├── test_normalized_db.py
+│   └── test_integration.py
+│
+├── QUICKSTART.md                    # Quick start guide
+├── DEVELOPERS.md                    # Developer reference
+├── NORMALIZED_DATABASE.md           # Schema documentation
+└── pyproject.toml                   # Project configuration
 ```
 
 ## Dependencies
 
-### Required Dependencies
+### Required
 
-- **Python 3.12+**: Core runtime
+- **Python 3.12+**
 - **psycopg2-binary**: PostgreSQL adapter
-- **tqdm**: Progress bars and monitoring
-- **requests**: HTTP client for PDF downloads
+- **tqdm**: Progress bars
+- **requests**: HTTP client
+- **python-dotenv**: Environment file support
 
-### Optional Dependencies
+### Optional
 
-- **pytest**: For running tests
-- **memory_profiler**: For memory usage analysis
+- **pytest**: Testing framework
+- **AWS CLI**: For downloading OpenAlex snapshots
 
 ### Installation
 
 ```bash
-# Using pip
-pip install psycopg2-binary tqdm requests
-
 # Using uv (recommended)
 uv sync
 
+# Using pip
+pip install psycopg2-binary tqdm requests python-dotenv
+
 # Development dependencies
-pip install pytest memory_profiler
+pip install pytest
+```
+
+## Performance Tips
+
+### For Large Imports (100GB+)
+
+```bash
+# Use larger batch sizes
+python doi_url_importer.py --batch-size 50000 --resume
+```
+
+```sql
+-- PostgreSQL tuning
+SET work_mem = '256MB';
+ALTER TABLE unpaywall.doi_urls SET (autovacuum_enabled = false);
+-- Run import...
+ALTER TABLE unpaywall.doi_urls SET (autovacuum_enabled = true);
+ANALYZE unpaywall.doi_urls;
+```
+
+### For Memory-Constrained Systems
+
+```bash
+# Use smaller batch sizes
+python doi_url_importer.py --batch-size 5000
+
+# Disable line counting for maximum speed
+# (In Python: CSVBatchProcessor(..., enable_line_count=False))
+```
+
+## Testing
+
+```bash
+# Run all tests
+pytest test/ -v
+
+# Run specific tests
+pytest test/test_file_tracker.py -v
+
+# With coverage
+pytest test/ --cov=. --cov-report=html
+```
+
+## Troubleshooting
+
+### Memory Issues
+
+```
+Error: MemoryError during CSV processing
+```
+**Solution**: Reduce batch size with `--batch-size 5000`
+
+### Database Connection Issues
+
+```
+Error: psycopg2.OperationalError: could not connect to server
+```
+**Solution**: Check `.env` file and database availability:
+```bash
+psql -h localhost -U myuser -d unpaywall -c "SELECT 1;"
+```
+
+### Interrupted Processing
+
+```bash
+# Check progress
+python -c "from helpers.file_tracker import FileTracker; print(FileTracker('urls.tracking.db').get_processing_summary())"
+
+# Resume from where you left off
+python openalex_unpaywall_extractor.py --resume
+python doi_url_importer.py --resume
+```
+
+### Corrupted Tracking Database
+
+```bash
+# Remove tracking file to restart
+rm urls.tracking.db
+
+# Re-run with resume (will reprocess all files)
+python openalex_unpaywall_extractor.py --resume
 ```
 
 ## Contributing
 
-### Development Setup
+1. Fork the repository
+2. Create a feature branch
+3. Write tests for new functionality
+4. Follow PEP 8 style guidelines
+5. Submit a pull request
 
-```bash
-# Clone repository
-git clone <repository-url>
-cd local_unpaywall
-
-# Set up virtual environment
-python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-
-# Install dependencies
-uv sync
-
-# Run tests
-python test/run_all_tests.py
-```
-
-### Code Style
-
-- Follow PEP 8 style guidelines
-- Include type hints for all functions
-- Add comprehensive docstrings
-- Write unit tests for new features
-- Update documentation in `manual/` directory
+See [DEVELOPERS.md](DEVELOPERS.md) for detailed contribution guidelines.
 
 ## License
 
-This project is licensed under the MIT License. See the LICENSE file for details.
+This project is licensed under the MIT License.
 
 ## Acknowledgments
 
-- **OpenAlex**: For providing comprehensive open access publication data
-- **Unpaywall**: For inspiration and the original concept
-- **PostgreSQL**: For robust database capabilities
-- **Python Community**: For excellent libraries and tools
-
-## Support and Documentation
-
-- **Manual**: Detailed technical documentation in the `manual/` directory:
-  - [File Tracking System](manual/file_tracking_system.md)
-  - [Memory-Efficient CSV Processing](manual/memory_efficient_csv_processing.md)
-  - [PDF Fetcher Utility](manual/pdf_fetcher.md)
-  - [Testing Guide](manual/testing_guide.md)
-  - [Complete Manual Index](manual/README.md)
-- **Tests**: Comprehensive test suite in the `test/` directory
-- **Logs**: Check `*.log` files for detailed processing information
-- **Issues**: Report bugs and feature requests through the project repository
+- **[OpenAlex](https://openalex.org/)**: Open scholarly metadata
+- **[Unpaywall](https://unpaywall.org/)**: Inspiration for the project
+- **PostgreSQL**: Robust database capabilities
 
 ---
 
